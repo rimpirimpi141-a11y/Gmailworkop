@@ -1,0 +1,6 @@
+{
+  "name": "GrammY Worker Bot Studio",
+  "description": "Production-ready Telegram Bot built with grammY for Cloudflare Workers with KV state management, UPI withdrawal workflows, and an interactive Telegram inline keyboard simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

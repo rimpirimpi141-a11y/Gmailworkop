@@ -1,0 +1,18 @@
+name = "grammy-telegram-task-bot"
+main = "worker.js"
+compatibility_date = "2025-02-01"
+
+# Bind Cloudflare Workers KV Namespace as env.BOT_KV
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID"
+
+[vars]
+BOT_USERNAME = "GmailTaskRewardsBot"
+ADMIN_CHAT_ID = "-1001234567890"
+SUPPORT_URL = "https://t.me/YourAdminSupport"
+NEWS_URL = "https://t.me/YourProjectNews"
+
+# Set BOT_TOKEN securely via Wrangler CLI:
+# npx wrangler secret put BOT_TOKEN
