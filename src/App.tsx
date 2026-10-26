@@ -5,29 +5,29 @@ import {
   Download,
   Send,
   RotateCcw,
-  Terminal,
   Database,
-  Code2,
   MessageSquare,
   ExternalLink,
-  AlertCircle,
   PlusCircle,
   ArrowUpRight,
-  SlidersHorizontal,
+  ShieldAlert,
+  UserCheck,
+  Lock,
 } from 'lucide-react';
 import {
   WORKER_JS_SOURCE,
   WRANGLER_TOML_SOURCE,
   WORKER_PACKAGE_JSON,
   createInitialUser,
+  createInitialGlobalKv,
   renderHomeText,
   buildMainMenuKeyboard,
   dispatchCallbackQuery,
   processTextInput,
   BotUserSchema,
+  GlobalKvConfig,
   InlineKeyboardGrid,
   AdminChannelAlert,
-  MIN_WITHDRAWAL_INR,
 } from './botEngine';
 
 interface ChatMessage {
@@ -39,7 +39,8 @@ interface ChatMessage {
   editedAt?: string;
 }
 
-const KV_STORAGE_KEY = 'grammy_worker_bot_kv_v1';
+const KV_USER_STORAGE_KEY = 'grammy_worker_bot_kv_user_v2';
+const KV_GLOBAL_STORAGE_KEY = 'grammy_worker_bot_kv_global_v2';
 
 // Helper to render Telegram-style Markdown (*bold*, _italic_, `code`) cleanly in JSX
 function renderTelegramMarkdown(text: string, onCopyCode?: (val: string) => void) {
@@ -100,13 +101,28 @@ function renderTelegramMarkdown(text: string, onCopyCode?: (val: string) => void
 export default function App() {
   const [user, setUser] = useState<BotUserSchema>(() => {
     try {
-      const saved = localStorage.getItem(KV_STORAGE_KEY);
+      const saved = localStorage.getItem(KV_USER_STORAGE_KEY);
       if (saved) return JSON.parse(saved);
     } catch {
       // ignore storage errors
     }
     return createInitialUser();
   });
+
+  const [globalKv, setGlobalKv] = useState<GlobalKvConfig>(() => {
+    try {
+      const saved = localStorage.getItem(KV_GLOBAL_STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore storage errors
+    }
+    return createInitialGlobalKv();
+  });
+
+  // Simulation controls for testing Admin vs Regular User & Force-Join channel membership
+  const [isAdminRole, setIsAdminRole] = useState<boolean>(true);
+  const [hasJoinedForceChannels, setHasJoinedForceChannels] = useState<boolean>(true);
+  const [kvInspectorView, setKvInspectorView] = useState<'global' | 'user'>('global');
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const initial = createInitialUser();
@@ -127,7 +143,6 @@ export default function App() {
     ];
   });
 
-  const [activeScreenLabel, setActiveScreenLabel] = useState<string>('Home Dashboard (/start)');
   const [lastCallbackData, setLastCallbackData] = useState<string>('/start');
   const [chatInput, setChatInput] = useState<string>('');
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<'sandbox' | 'code' | 'kv' | 'deploy'>('sandbox');
@@ -140,24 +155,24 @@ export default function App() {
   // Admin channel alerts (env.ADMIN_CHAT_ID)
   const [adminAlerts, setAdminAlerts] = useState<AdminChannelAlert[]>([
     {
-      id: 'UPI-M91X74K2',
-      txId: 'UPI-M91X74K2',
+      id: 'UPI-P84K19X',
+      txId: 'UPI-P84K19X',
       userId: '749201842',
       userName: 'Aarav (@aarav_dev)',
       amountInr: 50,
       upiId: 'aarav.dev@okaxis',
       holderName: 'Aarav Sharma',
-      timestamp: '2026-10-23T18:05:00.000Z',
+      timestamp: '2026-10-25T19:20:00.000Z',
+      status: 'PROCESSING',
       rawMarkdown:
         `🚨 *NEW UPI WITHDRAWAL REQUEST*\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `🆔 *Transaction ID:* \`UPI-M91X74K2\`\n` +
+        `🆔 *Transaction ID:* \`UPI-P84K19X\`\n` +
         `👤 *User:* Aarav (@aarav_dev)\n` +
         `🔢 *User ID:* \`749201842\`\n` +
         `💰 *Payout Amount:* *₹50.00*\n` +
         `🏦 *UPI Handle:* \`aarav.dev@okaxis\`\n` +
         `🪪 *Account Holder:* \`Aarav Sharma\`\n` +
-        `✅ *Verified Accounts:* \`3\`\n` +
         `━━━━━━━━━━━━━━━━━━━━━━`,
     },
   ]);
@@ -170,11 +185,19 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(KV_STORAGE_KEY, JSON.stringify(user));
+      localStorage.setItem(KV_USER_STORAGE_KEY, JSON.stringify(user));
     } catch {
       // ignore
     }
   }, [user]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(KV_GLOBAL_STORAGE_KEY, JSON.stringify(globalKv));
+    } catch {
+      // ignore
+    }
+  }, [globalKv]);
 
   useEffect(() => {
     if (chatContainerRef.current) {
@@ -202,10 +225,19 @@ export default function App() {
 
   const handleInlineButtonClick = (callbackData?: string, url?: string) => {
     if (url) {
-      setTgPopup({
-        text: `🔗 External Telegram URL Triggered:\n${url}`,
-        showAlert: false,
-      });
+      // If clicking a Force-Join channel link in the simulator, automatically mark as joined for easy testing!
+      if (!hasJoinedForceChannels) {
+        setHasJoinedForceChannels(true);
+        setTgPopup({
+          text: `📢 Joined Channel (${url})!\nNow click "🔄 Check / Verified" to unlock the bot.`,
+          showAlert: false,
+        });
+      } else {
+        setTgPopup({
+          text: `🔗 External Telegram URL Triggered:\n${url}`,
+          showAlert: false,
+        });
+      }
       setTimeout(() => setTgPopup(null), 3500);
       return;
     }
@@ -213,14 +245,18 @@ export default function App() {
     if (!callbackData) return;
 
     setLastCallbackData(callbackData);
-    const { updatedUser, result } = dispatchCallbackQuery(callbackData, user);
+    const { updatedUser, updatedKv, result } = dispatchCallbackQuery(
+      callbackData,
+      user,
+      globalKv,
+      { isAdminRole, hasJoinedForceChannels }
+    );
     setUser(updatedUser);
-    setActiveScreenLabel(result.activeScreenLabel);
+    setGlobalKv(updatedKv);
 
     const nowTime = new Date().toTimeString().slice(0, 8);
 
     setMessages((prev) => {
-      // Edit last bot message in-place (simulating grammY ctx.editMessageText)
       const lastBotIndex = [...prev].reverse().findIndex((m) => m.sender === 'bot');
       if (result.editInPlace && lastBotIndex !== -1) {
         const targetIdx = prev.length - 1 - lastBotIndex;
@@ -266,10 +302,15 @@ export default function App() {
       timestamp: nowTime,
     };
 
-    const { updatedUser, result } = processTextInput(textToSend, user);
+    const { updatedUser, updatedKv, result } = processTextInput(
+      textToSend,
+      user,
+      globalKv,
+      { isAdminRole, hasJoinedForceChannels }
+    );
     setUser(updatedUser);
-    setLastCallbackData(`message:text ("${textToSend}")`);
-    setActiveScreenLabel(result.activeScreenLabel);
+    setGlobalKv(updatedKv);
+    setLastCallbackData(`message ("${textToSend}")`);
 
     const botMsg: ChatMessage = {
       id: `bot-${Date.now() + 1}`,
@@ -294,43 +335,40 @@ export default function App() {
     }
   };
 
-  const handleQuickAddBalance = (amount: number) => {
-    const updated: BotUserSchema = {
-      ...user,
-      balanceInr: user.balanceInr + amount,
-      lifetimeInr: user.lifetimeInr + amount,
-      updatedAt: new Date().toISOString(),
-    };
-    setUser(updated);
-    // Re-render current screen if on home or balance
-    if (lastCallbackData === 'menu_balance') {
-      const { result } = dispatchCallbackQuery('menu_balance', updated);
-      setMessages((prev) => {
-        const copy = [...prev];
-        const idx = copy.length - 1;
-        if (idx >= 0 && copy[idx].sender === 'bot') {
-          copy[idx] = { ...copy[idx], text: result.messageText, keyboard: result.keyboard };
-        }
-        return copy;
-      });
-    } else if (lastCallbackData === 'menu_home' || lastCallbackData === '/start') {
-      const { result } = dispatchCallbackQuery('menu_home', updated);
-      setMessages((prev) => {
-        const copy = [...prev];
-        const idx = copy.length - 1;
-        if (idx >= 0 && copy[idx].sender === 'bot') {
-          copy[idx] = { ...copy[idx], text: result.messageText, keyboard: result.keyboard };
-        }
-        return copy;
-      });
-    }
+  const handleTestForceJoinFlow = () => {
+    setIsAdminRole(false);
+    setHasJoinedForceChannels(false);
+    const nowTime = new Date().toTimeString().slice(0, 8);
+    const { updatedUser, updatedKv, result } = processTextInput(
+      '/start',
+      user,
+      globalKv,
+      { isAdminRole: false, hasJoinedForceChannels: false }
+    );
+    setUser(updatedUser);
+    setGlobalKv(updatedKv);
+    setLastCallbackData('force_join_gate');
+    setMessages((prev) => [
+      ...prev,
+      { id: `u-${Date.now()}`, sender: 'user', text: '/start', timestamp: nowTime },
+      {
+        id: `b-${Date.now() + 1}`,
+        sender: 'bot',
+        text: result.messageText,
+        keyboard: result.keyboard,
+        timestamp: nowTime,
+      },
+    ]);
   };
 
   const handleResetKvState = () => {
-    const fresh = createInitialUser();
-    setUser(fresh);
+    const freshUser = createInitialUser();
+    const freshKv = createInitialGlobalKv();
+    setUser(freshUser);
+    setGlobalKv(freshKv);
+    setIsAdminRole(true);
+    setHasJoinedForceChannels(true);
     setLastCallbackData('/start');
-    setActiveScreenLabel('Home Dashboard (/start)');
     const nowTime = new Date().toTimeString().slice(0, 8);
     setMessages([
       {
@@ -342,7 +380,7 @@ export default function App() {
       {
         id: `reset-bot-${Date.now() + 1}`,
         sender: 'bot',
-        text: renderHomeText(fresh),
+        text: renderHomeText(freshUser),
         keyboard: buildMainMenuKeyboard(),
         timestamp: nowTime,
       },
@@ -359,6 +397,10 @@ export default function App() {
   const webhookSetCommand = `curl -X POST "https://api.telegram.org/bot${webhookBotToken.trim()}/setWebhook?url=${encodeURIComponent(
     webhookWorkerUrl.trim()
   )}"`;
+
+  const pendingPayoutsCount = globalKv.payoutQueue.filter(
+    (p) => p.status === 'PROCESSING'
+  ).length;
 
   return (
     <div className="min-h-screen bg-[#0F172A] text-slate-100 flex flex-col">
@@ -441,63 +483,75 @@ export default function App() {
       </header>
 
       {/* ===================================================================
-          WORKSPACE SUMMARY STRIP (Tabular Numerals, Unboxed Metadata)
+          WORKSPACE SUMMARY & ADMIN / FORCE-JOIN SIMULATION CONTROLS
          =================================================================== */}
       <section className="border-b border-slate-800 bg-[#131C31] px-6 py-3">
         <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-4">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
-            <span className="text-slate-200 font-medium">Cloudflare Workers Runtime</span>
-            <span aria-hidden="true">·</span>
-            <span>grammY Webhook Engine</span>
-            <span aria-hidden="true">·</span>
-            <span>Pure InlineKeyboardMarkup</span>
+            <span className="text-slate-200 font-medium">Enterprise Admin + Force-Join Engine</span>
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums text-sky-300">
-              KV State: {user.state}
+              State: {user.state}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-mono tabular-nums">
+              Task Rate: ₹{globalKv.rates.taskRewardInr}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-mono tabular-nums">
+              Maintenance: {globalKv.maintenance.enabled ? 'ON' : 'OFF'}
             </span>
           </div>
 
-          {/* Mobile view switcher + Quick testing actions */}
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex md:hidden items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
-              {(['sandbox', 'code', 'kv', 'deploy'] as const).map((tab) => (
-                <button
-                  key={tab}
-                  type="button"
-                  onClick={() => setActiveWorkspaceTab(tab)}
-                  className={`px-2.5 py-1 text-xs font-medium rounded whitespace-nowrap shrink-0 ${
-                    activeWorkspaceTab === tab
-                      ? 'bg-sky-500 text-slate-950'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  {tab === 'sandbox'
-                    ? 'Sandbox'
-                    : tab === 'code'
-                    ? 'Code'
-                    : tab === 'kv'
-                    ? 'KV'
-                    : 'Deploy'}
-                </button>
-              ))}
-            </div>
-
+            {/* Role Toggle (Admin vs Regular User) */}
             <button
               type="button"
-              onClick={() => handleQuickAddBalance(30)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums"
+              onClick={() => setIsAdminRole((prev) => !prev)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                isAdminRole
+                  ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
+                  : 'bg-slate-900 text-slate-300 border-slate-800 hover:text-white'
+              }`}
+              title="Toggle whether your simulated Telegram account is an authorized Admin"
             >
-              <PlusCircle className="w-3.5 h-3.5" />
-              Add +₹30 Test Balance
+              <ShieldAlert className="w-3.5 h-3.5" />
+              Role: {isAdminRole ? 'Super Admin (Bypass On)' : 'Regular User'}
+            </button>
+
+            {/* Force-Join Membership Simulator Toggle */}
+            <button
+              type="button"
+              onClick={() => setHasJoinedForceChannels((prev) => !prev)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                hasJoinedForceChannels
+                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                  : 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+              }`}
+              title="Simulate getChatMember status for config:force_channels"
+            >
+              <UserCheck className="w-3.5 h-3.5" />
+              Channels: {hasJoinedForceChannels ? 'Joined' : 'Not Joined'}
             </button>
 
             <button
               type="button"
-              onClick={() => handleSendTextMessage(undefined, '/start ref_991827')}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              onClick={handleTestForceJoinFlow}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <ArrowUpRight className="w-3.5 h-3.5" />
-              Simulate Referral (/start ref_991827)
+              <Lock className="w-3.5 h-3.5" />
+              Test Force-Join Gate
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setIsAdminRole(true);
+                handleSendTextMessage(undefined, '/admin');
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Open /admin Panel
             </button>
 
             <button
@@ -519,7 +573,7 @@ export default function App() {
         {activeWorkspaceTab === 'sandbox' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             {/* LEFT 5 COLUMNS: LIVE TELEGRAM INLINE BOT SIMULATOR */}
-            <div className="lg:col-span-5 bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[740px]">
+            <div className="lg:col-span-5 bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[760px]">
               {/* Telegram Client Header */}
               <div className="px-4 py-3 bg-[#17212B] border-b border-slate-800 flex items-center justify-between">
                 <div className="flex items-center gap-3 min-w-0">
@@ -531,36 +585,50 @@ export default function App() {
                       Gmail Task Hub Bot
                     </div>
                     <div className="text-xs text-slate-400 truncate">
-                      @GmailTaskRewardsBot · bot · editMessageText mode
+                      @GmailTaskRewardsBot · /start & /admin
                     </div>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => handleInlineButtonClick('menu_home')}
-                  className="px-2.5 py-1 text-xs font-medium text-sky-300 bg-slate-800/80 hover:bg-slate-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  /home
-                </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => handleSendTextMessage(undefined, '/start')}
+                    className="px-2.5 py-1 text-xs font-medium text-sky-300 bg-slate-800/80 hover:bg-slate-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    /start
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAdminRole(true);
+                      handleSendTextMessage(undefined, '/admin');
+                    }}
+                    className="px-2.5 py-1 text-xs font-semibold text-emerald-300 bg-emerald-950/80 hover:bg-emerald-900/80 border border-emerald-700/50 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    /admin
+                  </button>
+                </div>
               </div>
 
               {/* Quick Submenu Jump Bar */}
               <div className="px-3 py-2 bg-[#131C27] border-b border-slate-800/80 flex items-center gap-1.5 overflow-x-auto">
                 <span className="text-[11px] text-slate-400 shrink-0 mr-1">Jump:</span>
                 {[
-                  { label: '🏠 Home', cb: 'menu_home' },
-                  { label: '📩 Register', cb: 'menu_register' },
-                  { label: '📑 Accounts', cb: 'menu_accounts' },
-                  { label: '👛 Balance', cb: 'menu_balance' },
-                  { label: '👥 Referrals', cb: 'menu_referrals' },
-                  { label: '🎁 Rewards', cb: 'menu_rewards' },
-                  { label: '⚙️ Settings', cb: 'menu_settings' },
-                  { label: '❓ Help', cb: 'menu_help' },
+                  { label: '🛡️ /admin', cb: 'admin_home', forceAdmin: true },
+                  { label: '💳 Payouts', cb: 'admin_payouts', forceAdmin: true },
+                  { label: '🎁 Rates', cb: 'admin_rates', forceAdmin: true },
+                  { label: '📢 Channels', cb: 'admin_channels', forceAdmin: true },
+                  { label: '🏠 /start', cb: 'menu_home', forceAdmin: false },
+                  { label: '📩 Register', cb: 'menu_register', forceAdmin: false },
+                  { label: '👛 Balance', cb: 'menu_balance', forceAdmin: false },
                 ].map((item) => (
                   <button
                     key={item.cb}
                     type="button"
-                    onClick={() => handleInlineButtonClick(item.cb)}
+                    onClick={() => {
+                      if (item.forceAdmin) setIsAdminRole(true);
+                      handleInlineButtonClick(item.cb);
+                    }}
                     className="px-2 py-1 text-[11px] font-medium text-slate-300 hover:text-white bg-slate-800/70 hover:bg-slate-700/80 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     {item.label}
@@ -599,7 +667,7 @@ export default function App() {
                     </div>
 
                     {/* Pure InlineKeyboardMarkup Grid */}
-                    {msg.sender === 'bot' && msg.keyboard && (
+                    {msg.sender === 'bot' && msg.keyboard && msg.keyboard.length > 0 && (
                       <div className="w-full max-w-[92%] mt-1.5 space-y-1">
                         {msg.keyboard.map((row, rowIdx) => (
                           <div
@@ -668,25 +736,66 @@ export default function App() {
                 )}
               </div>
 
-              {/* Stateful AWAITING_UPI Helper Banner when in AWAITING_UPI state */}
-              {user.state === 'AWAITING_UPI' && (
+              {/* Contextual Input Helper Banner when bot is awaiting user or admin input */}
+              {user.state !== 'IDLE' && (
                 <div className="px-4 py-2 bg-amber-950/60 border-t border-amber-700/50 flex items-center justify-between gap-2 text-xs text-amber-200">
-                  <span className="truncate">
-                    State is <strong>AWAITING_UPI</strong> — enter UPI ID & Name below:
+                  <span className="truncate font-mono">
+                    State: <strong>{user.state}</strong>
                   </span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleSendTextMessage(undefined, 'aarav.sharma@okaxis Aarav Sharma')
-                    }
-                    className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    Fill Sample UPI
-                  </button>
+                  {user.state === 'AWAITING_UPI' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(undefined, 'aarav.sharma@okaxis Aarav Sharma')
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Sample UPI
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_REJECT_REASON' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(
+                          undefined,
+                          'Invalid UPI handle — please verify and resubmit'
+                        )
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Sample Reason
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_FORCE_CHANNEL' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(undefined, '@TelegramPayoutProofs')
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send @TelegramPayoutProofs
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_BROADCAST' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(
+                          undefined,
+                          '🔥 *Weekend Bonus Alert!* Task rewards have been boosted! Complete 5 tasks today for instant UPI payouts.'
+                        )
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Sample Broadcast
+                    </button>
+                  )}
                 </div>
               )}
 
-              {/* Telegram Message Input Bar (No ReplyKeyboardMarkup — strictly text/commands) */}
+              {/* Telegram Message Input Bar */}
               <form
                 onSubmit={(e) => handleSendTextMessage(e)}
                 className="p-3 bg-[#17212B] border-t border-slate-800 flex items-center gap-2"
@@ -696,9 +805,9 @@ export default function App() {
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   placeholder={
-                    user.state === 'AWAITING_UPI'
-                      ? 'Send UPI ID & Name (e.g. rahul@okaxis Rahul Sharma)...'
-                      : 'Send /start, /home, or UPI ID when prompted...'
+                    user.state !== 'IDLE'
+                      ? `Enter input for ${user.state}...`
+                      : 'Send /admin, /start, /home, or text...'
                   }
                   className="flex-1 bg-[#0E1621] text-white placeholder-slate-500 text-xs px-3.5 py-2.5 rounded-lg border border-slate-800 focus:outline-none focus:border-sky-500"
                 />
@@ -712,68 +821,92 @@ export default function App() {
               </form>
             </div>
 
-            {/* RIGHT 7 COLUMNS: KV STATE INSPECTOR, ADMIN CHANNEL FEED & SOURCE CODE */}
+            {/* RIGHT 7 COLUMNS: KV STATE INSPECTOR, ADMIN QUEUE & SOURCE CODE */}
             <div className="lg:col-span-7 space-y-6">
               {/* Top KPI Strip (Tabular Numerals, Single-Elevation Surface) */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Wallet Balance (INR)</div>
+                  <div className="text-xs text-slate-400">User Wallet (INR)</div>
                   <div className="mt-1 text-xl font-bold text-white font-mono tabular-nums">
                     ₹{user.balanceInr.toFixed(2)}
                   </div>
                   <div className="mt-1 text-[11px] text-slate-400 font-mono tabular-nums">
-                    Min Payout: ₹{MIN_WITHDRAWAL_INR.toFixed(2)}
+                    Min Withdraw: ₹{globalKv.rates.minWithdrawalInr.toFixed(2)}
                   </div>
                 </div>
 
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Verified Accounts</div>
+                  <div className="text-xs text-slate-400">Dynamic Task Rate</div>
                   <div className="mt-1 text-xl font-bold text-emerald-400 font-mono tabular-nums">
-                    {user.accounts.approved}
+                    ₹{globalKv.rates.taskRewardInr.toFixed(2)}
                   </div>
                   <div className="mt-1 text-[11px] text-slate-400 font-mono tabular-nums">
-                    +₹15.00 ($0.20) / task
+                    Referral: ₹{globalKv.rates.referralBonusInr.toFixed(2)}
                   </div>
                 </div>
 
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Session State (BOT_KV)</div>
-                  <div
-                    className={`mt-1 text-base font-bold font-mono tabular-nums ${
-                      user.state === 'AWAITING_UPI' ? 'text-amber-400' : 'text-sky-400'
-                    }`}
-                  >
-                    {user.state}
+                  <div className="text-xs text-slate-400">Pending UPI Queue</div>
+                  <div className="mt-1 text-xl font-bold text-amber-400 font-mono tabular-nums">
+                    {pendingPayoutsCount} tx
                   </div>
                   <div className="mt-1 text-[11px] text-slate-400 truncate">
-                    Last: {lastCallbackData}
+                    config:payout_queue
                   </div>
                 </div>
 
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Referrals & Streak</div>
-                  <div className="mt-1 text-xl font-bold text-white font-mono tabular-nums">
-                    {user.referrals.invitedCount} · {user.rewards.streakDays}d
+                  <div className="text-xs text-slate-400">Force Channels</div>
+                  <div className="mt-1 text-xl font-bold text-sky-400 font-mono tabular-nums">
+                    {globalKv.forceChannels.length} active
                   </div>
-                  <div className="mt-1 text-[11px] text-slate-400 font-mono tabular-nums">
-                    Earned: ₹{user.referrals.totalCommissionInr.toFixed(2)}
+                  <div className="mt-1 text-[11px] text-slate-400 truncate">
+                    Sub-Admins: {globalKv.admins.length}
                   </div>
                 </div>
               </div>
 
-              {/* Live Cloudflare Workers KV (env.BOT_KV) & Admin Alert Split */}
+              {/* Live Cloudflare Workers KV (env.BOT_KV) & Admin Payout Queue Split */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {/* Live KV JSON State Viewer */}
-                <div className="bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[310px]">
-                  <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                      <Database className="w-4 h-4 text-sky-400" />
-                      <span>env.BOT_KV (`user:{user.userId}`)</span>
+                <div className="bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[320px]">
+                  <div className="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <Database className="w-4 h-4 text-sky-400 shrink-0" />
+                      <button
+                        type="button"
+                        onClick={() => setKvInspectorView('global')}
+                        className={`px-2 py-0.5 text-[11px] font-mono rounded cursor-pointer ${
+                          kvInspectorView === 'global'
+                            ? 'bg-sky-500 text-slate-950 font-semibold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        config:*
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setKvInspectorView('user')}
+                        className={`px-2 py-0.5 text-[11px] font-mono rounded cursor-pointer ${
+                          kvInspectorView === 'user'
+                            ? 'bg-sky-500 text-slate-950 font-semibold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        user:{user.userId}
+                      </button>
                     </div>
                     <button
                       type="button"
                       onClick={() =>
-                        handleCopy(JSON.stringify(user, null, 2), 'copy_kv_json')
+                        handleCopy(
+                          JSON.stringify(
+                            kvInspectorView === 'global' ? globalKv : user,
+                            null,
+                            2
+                          ),
+                          'copy_kv_json'
+                        )
                       }
                       className="text-xs text-slate-400 hover:text-white inline-flex items-center gap-1 cursor-pointer"
                     >
@@ -785,47 +918,95 @@ export default function App() {
                       ) : (
                         <>
                           <Copy className="w-3.5 h-3.5" />
-                          Copy JSON
+                          Copy
                         </>
                       )}
                     </button>
                   </div>
                   <pre className="flex-1 p-4 overflow-auto text-[11.5px] leading-relaxed font-mono tabular-nums text-sky-200 bg-[#0B1120]">
-                    {JSON.stringify(user, null, 2)}
+                    {JSON.stringify(
+                      kvInspectorView === 'global' ? globalKv : user,
+                      null,
+                      2
+                    )}
                   </pre>
                 </div>
 
-                {/* Admin Channel Feed (env.ADMIN_CHAT_ID) */}
-                <div className="bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[310px]">
+                {/* Live Payout Queue & Admin Channel Feed */}
+                <div className="bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[320px]">
                   <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
                     <div className="flex items-center gap-2 text-xs font-semibold text-white">
                       <MessageSquare className="w-4 h-4 text-emerald-400" />
-                      <span>Admin Payout Feed (`env.ADMIN_CHAT_ID`)</span>
+                      <span>UPI Payout Queue (`config:payout_queue`)</span>
                     </div>
-                    <span className="text-[11px] text-slate-400 font-mono tabular-nums">
-                      {adminAlerts.length} alert(s)
-                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAdminRole(true);
+                        handleInlineButtonClick('admin_payouts');
+                      }}
+                      className="text-[11px] text-sky-300 hover:text-sky-200 font-medium cursor-pointer"
+                    >
+                      Manage in Chat →
+                    </button>
                   </div>
-                  <div className="flex-1 p-3.5 overflow-y-auto space-y-3 bg-[#0B1120]">
-                    {adminAlerts.map((alert) => (
+                  <div className="flex-1 p-3.5 overflow-y-auto space-y-2.5 bg-[#0B1120]">
+                    {globalKv.payoutQueue.map((item) => (
                       <div
-                        key={alert.id}
-                        className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs space-y-1"
+                        key={item.txId}
+                        className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs space-y-1.5"
                       >
-                        <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono tabular-nums">
-                          <span className="text-emerald-400 font-semibold">
-                            {alert.txId}
+                        <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
+                          <span className="text-white font-semibold">{item.txId}</span>
+                          <span
+                            className={
+                              item.status === 'COMPLETED'
+                                ? 'text-emerald-400'
+                                : item.status === 'REJECTED'
+                                ? 'text-rose-400'
+                                : 'text-amber-400'
+                            }
+                          >
+                            {item.status}
                           </span>
-                          <span>{alert.timestamp.slice(0, 19).replace('T', ' ')}</span>
                         </div>
                         <div className="text-slate-200 font-mono tabular-nums">
-                          Amount: <strong>₹{alert.amountInr.toFixed(2)}</strong> →{' '}
-                          <span className="text-sky-300">{alert.upiId}</span>
+                          ₹{item.amountInr.toFixed(2)} →{' '}
+                          <span className="text-sky-300">{item.upiId}</span> ({item.holderName})
                         </div>
-                        <div className="text-slate-400 text-[11px]">
-                          User: {alert.userName} (ID: {alert.userId}) · Holder:{' '}
-                          {alert.holderName}
-                        </div>
+                        {item.rejectReason && (
+                          <div className="text-[11px] text-rose-300">
+                            Reason: {item.rejectReason}
+                          </div>
+                        )}
+                        {item.status === 'PROCESSING' && (
+                          <div className="flex items-center gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsAdminRole(true);
+                                handleInlineButtonClick(
+                                  `admin_payout_approve_${item.txId}`
+                                );
+                              }}
+                              className="px-2 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 rounded text-[11px] font-medium cursor-pointer"
+                            >
+                              ✅ Approve & Mark Paid
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsAdminRole(true);
+                                handleInlineButtonClick(
+                                  `admin_payout_reject_${item.txId}`
+                                );
+                              }}
+                              className="px-2 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 rounded text-[11px] font-medium cursor-pointer"
+                            >
+                              ❌ Reject & Refund
+                            </button>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -910,10 +1091,10 @@ export default function App() {
             <div className="px-6 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h1 className="text-lg font-bold text-white font-display">
-                  Production Cloudflare Worker Source (`worker.js`)
+                  Complete Upgraded Cloudflare Worker (`worker.js`)
                 </h1>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  ES Module exporting <code className="text-sky-300">fetch(request, env, ctx)</code> with grammY <code className="text-sky-300">webhookCallback(bot, &quot;cloudflare-mod&quot;)</code> and <code className="text-sky-300">env.BOT_KV</code> persistence.
+                  Includes full user flows + <code className="text-sky-300">/admin</code> Enterprise Dashboard + Mandatory Force-Join middleware via <code className="text-sky-300">env.BOT_KV</code>.
                 </p>
               </div>
 
@@ -976,76 +1157,74 @@ export default function App() {
             <div className="lg:col-span-5 bg-[#1E293B] border border-slate-800 rounded-xl p-6 space-y-5">
               <div>
                 <h2 className="text-base font-bold text-white font-display">
-                  KV State Controls (`env.BOT_KV`)
+                  Cloudflare KV Namespace (`env.BOT_KV`)
                 </h2>
                 <p className="text-xs text-slate-400 mt-1">
-                  Test edge cases such as threshold checks (`balance &lt; ₹50` vs `balance &gt;= ₹50`), milestone unlocking, and `AWAITING_UPI` state recovery.
+                  Inspect and test all dynamic keys (`config:rates`, `config:force_channels`, `config:admins`, `config:maintenance`, `config:payout_queue`, and `user:{user.userId}`).
                 </p>
               </div>
 
-              <div className="space-y-3 pt-2 border-t border-slate-800 text-xs">
-                <div className="flex items-center justify-between py-2 border-b border-slate-800/70">
-                  <span className="text-slate-400">Current KV Key</span>
-                  <code className="text-sky-300 font-mono">user:{user.userId}</code>
+              <div className="space-y-2.5 pt-2 border-t border-slate-800 text-xs">
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">Super Admin (`env.ADMIN_CHAT_ID`)</span>
+                  <code className="text-sky-300 font-mono">{globalKv.superAdminId}</code>
                 </div>
-                <div className="flex items-center justify-between py-2 border-b border-slate-800/70">
-                  <span className="text-slate-400">Session State</span>
-                  <span className="font-mono font-semibold text-amber-300">{user.state}</span>
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">Secondary Admins (`config:admins`)</span>
+                  <span className="font-mono text-white">{globalKv.admins.length}</span>
                 </div>
-                <div className="flex items-center justify-between py-2 border-b border-slate-800/70">
-                  <span className="text-slate-400">Available Balance</span>
-                  <span className="font-mono tabular-nums font-semibold text-emerald-400">
-                    ₹{user.balanceInr.toFixed(2)}
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">Force Channels (`config:force_channels`)</span>
+                  <span className="font-mono text-sky-300">{globalKv.forceChannels.length}</span>
+                </div>
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">Maintenance (`config:maintenance`)</span>
+                  <span className="font-mono font-semibold text-amber-300">
+                    {globalKv.maintenance.enabled ? 'ENABLED' : 'DISABLED'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between py-2 border-b border-slate-800/70">
-                  <span className="text-slate-400">Approved Accounts</span>
-                  <span className="font-mono tabular-nums text-white">
-                    {user.accounts.approved}
-                  </span>
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">User Session State</span>
+                  <span className="font-mono font-semibold text-emerald-400">{user.state}</span>
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-2.5 pt-2">
                 <button
                   type="button"
-                  onClick={() => handleQuickAddBalance(50)}
+                  onClick={() =>
+                    setUser((prev) => ({
+                      ...prev,
+                      balanceInr: prev.balanceInr + 50,
+                      lifetimeInr: prev.lifetimeInr + 50,
+                    }))
+                  }
                   className="px-3 py-2 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-emerald-300 border border-slate-800 rounded-lg cursor-pointer transition-colors"
                 >
-                  +₹50.00 Balance
+                  +₹50.00 User Balance
                 </button>
                 <button
                   type="button"
                   onClick={() =>
-                    setUser((prev) => ({
+                    setGlobalKv((prev) => ({
                       ...prev,
-                      balanceInr: 30,
-                      updatedAt: new Date().toISOString(),
+                      maintenance: {
+                        ...prev.maintenance,
+                        enabled: !prev.maintenance.enabled,
+                        updatedAt: new Date().toISOString(),
+                      },
                     }))
                   }
                   className="px-3 py-2 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-amber-300 border border-slate-800 rounded-lg cursor-pointer transition-colors"
                 >
-                  Set Balance to ₹30 (Below Min)
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setUser((prev) => ({
-                      ...prev,
-                      accounts: { ...prev.accounts, approved: prev.accounts.approved + 5 },
-                      updatedAt: new Date().toISOString(),
-                    }))
-                  }
-                  className="px-3 py-2 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-800 rounded-lg cursor-pointer transition-colors"
-                >
-                  +5 Approved Accounts
+                  Toggle Maintenance
                 </button>
                 <button
                   type="button"
                   onClick={handleResetKvState}
-                  className="px-3 py-2 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-rose-300 border border-slate-800 rounded-lg cursor-pointer transition-colors"
+                  className="col-span-2 px-3 py-2 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-rose-300 border border-slate-800 rounded-lg cursor-pointer transition-colors"
                 >
-                  Reset Default KV
+                  Reset All KV Keys to Defaults
                 </button>
               </div>
             </div>
@@ -1053,11 +1232,16 @@ export default function App() {
             <div className="lg:col-span-7 bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col">
               <div className="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between">
                 <span className="text-xs font-semibold text-white font-mono">
-                  Raw JSON Value in env.BOT_KV.get(&quot;user:{user.userId}&quot;)
+                  Complete KV Dump (`config:*` + `user:{user.userId}`)
                 </span>
                 <button
                   type="button"
-                  onClick={() => handleCopy(JSON.stringify(user, null, 2), 'kv_tab_copy')}
+                  onClick={() =>
+                    handleCopy(
+                      JSON.stringify({ config: globalKv, user }, null, 2),
+                      'kv_tab_copy'
+                    )
+                  }
                   className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded cursor-pointer"
                 >
                   {copiedKey === 'kv_tab_copy' ? (
@@ -1073,8 +1257,8 @@ export default function App() {
                   )}
                 </button>
               </div>
-              <pre className="p-5 overflow-auto text-xs font-mono tabular-nums leading-relaxed text-sky-200 bg-[#0B1120] flex-1">
-                {JSON.stringify(user, null, 2)}
+              <pre className="p-5 overflow-auto text-xs font-mono tabular-nums leading-relaxed text-sky-200 bg-[#0B1120] flex-1 max-h-[600px]">
+                {JSON.stringify({ config: globalKv, user }, null, 2)}
               </pre>
             </div>
           </div>
@@ -1088,17 +1272,17 @@ export default function App() {
             <div className="lg:col-span-7 bg-[#1E293B] border border-slate-800 rounded-xl p-6 space-y-6">
               <div>
                 <h2 className="text-lg font-bold text-white font-display">
-                  01. Deploy to Cloudflare Workers
+                  01. Deploy Upgraded Worker & Admin Panel
                 </h2>
                 <p className="text-xs text-slate-400 mt-1">
-                  Follow these 4 commands to provision your <code className="text-sky-300">BOT_KV</code> namespace, configure secrets, and deploy the serverless webhook worker.
+                  Provision <code className="text-sky-300">BOT_KV</code>, set your <code className="text-sky-300">BOT_TOKEN</code> and <code className="text-sky-300">ADMIN_CHAT_ID</code> (Super Admin Telegram User ID), and deploy.
                 </p>
               </div>
 
               <div className="space-y-4 text-xs">
                 <div className="p-4 rounded-lg bg-[#0B1120] border border-slate-800 space-y-2">
                   <div className="font-semibold text-slate-200">
-                    Step 1: Install dependencies & create KV namespace
+                    Step 1: Install grammY & create KV namespace
                   </div>
                   <pre className="font-mono text-sky-300 overflow-x-auto">
 {`npm install grammy
@@ -1108,7 +1292,7 @@ npx wrangler kv namespace create BOT_KV`}
 
                 <div className="p-4 rounded-lg bg-[#0B1120] border border-slate-800 space-y-2">
                   <div className="font-semibold text-slate-200">
-                    Step 2: Add Secrets (`BOT_TOKEN` & `ADMIN_CHAT_ID`)
+                    Step 2: Configure `BOT_TOKEN` & Super Admin `ADMIN_CHAT_ID`
                   </div>
                   <pre className="font-mono text-sky-300 overflow-x-auto">
 {`npx wrangler secret put BOT_TOKEN
@@ -1118,7 +1302,7 @@ npx wrangler secret put ADMIN_CHAT_ID`}
 
                 <div className="p-4 rounded-lg bg-[#0B1120] border border-slate-800 space-y-2">
                   <div className="font-semibold text-slate-200">
-                    Step 3: Deploy Worker to Cloudflare Edge
+                    Step 3: Deploy to Cloudflare Workers
                   </div>
                   <pre className="font-mono text-sky-300 overflow-x-auto">
 {`npx wrangler deploy`}
@@ -1130,10 +1314,10 @@ npx wrangler secret put ADMIN_CHAT_ID`}
             <div className="lg:col-span-5 bg-[#1E293B] border border-slate-800 rounded-xl p-6 space-y-5">
               <div>
                 <h2 className="text-lg font-bold text-white font-display">
-                  02. Interactive Webhook Command Builder
+                  02. Register Telegram Webhook
                 </h2>
                 <p className="text-xs text-slate-400 mt-1">
-                  Bind your Telegram Bot Token to your deployed Cloudflare Worker URL.
+                  Point Telegram updates to your Cloudflare Worker endpoint.
                 </p>
               </div>
 
