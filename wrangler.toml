@@ -4,13 +4,11 @@ compatibility_date = "2024-09-23"
 
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "6c0887279ba94d15ab351985d495ad41"
 
 [vars]
-BOT_USERNAME = "GmailTaskRewardsBot"
-ADMIN_CHAT_ID = "YOUR_TELEGRAM_ADMIN_ID"
-SUPPORT_URL = "https://t.me/YourAdminSupport"
-NEWS_URL = "https://t.me/YourProjectNews"
+BOT_USERNAME = "Gmailsellnewbot"
+ADMIN_CHAT_ID = "8838351233"
+SUPPORT_URL = "https://t.me/RAO_SAHAB_45"
+NEWS_URL = "https://t.me/ChattingZone7"
 
-# Set BOT_TOKEN securely via Wrangler CLI or Cloudflare Dashboard:
-# npx wrangler secret put BOT_TOKEN
