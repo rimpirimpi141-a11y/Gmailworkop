@@ -5,19 +5,20 @@ export const WORKER_JS_SOURCE = workerSourceRaw;
 export const WRANGLER_TOML_SOURCE = wranglerSourceRaw;
 
 export const WORKER_PACKAGE_JSON = `{
-  "name": "grammy-cloudflare-worker-bot",
-  "version": "2.0.0",
+  "name": "gmailworkop",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
+  "main": "worker.js",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "grammy": "^1.35.0"
+    "grammy": "^1.30.0"
   },
   "devDependencies": {
-    "wrangler": "^3.109.0"
+    "wrangler": "^3.80.0"
   }
 }`;
 

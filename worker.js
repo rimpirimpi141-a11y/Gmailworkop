@@ -1,12 +1,13 @@
 /**
  * Production-Ready Telegram Task & Rewards Bot + Enterprise Dynamic Admin Panel
+ * Worker Name: gmailworkop
  * Framework: grammY (ES Module for Cloudflare Workers)
  * Storage: Cloudflare Workers KV (env.BOT_KV)
  *
  * KV Keys Architecture:
  * - user:<userId>          -> User profile, wallet, tasks, referrals, withdrawals, state, adminContext, isBanned
  * - config:admins          -> JSON array of secondary admin objects [{ id, addedBy, addedAt }]
- * - config:force_channels  -> JSON array of required channels [{ id, title, username, inviteLink }]
+ * - config:channels        -> JSON array of required force-join channels [{ id, title, inviteLink }]
  * - config:rates           -> JSON object { taskRewardInr, taskRewardUsd, minWithdrawalInr, referralBonusInr, dailyStreakBaseInr }
  * - config:maintenance     -> JSON object { enabled: boolean, updatedAt: string, updatedBy: string }
  * - config:users_index     -> JSON array of all registered userId strings ["749201842", ...]
@@ -79,7 +80,14 @@ async function getDynamicRates(kv) {
 }
 
 async function getForceChannels(kv) {
+  const channels = await getKvJson(kv, "config:channels", null);
+  if (channels !== null) return channels;
   return await getKvJson(kv, "config:force_channels", []);
+}
+
+async function saveForceChannels(kv, channels) {
+  await putKvJson(kv, "config:channels", channels);
+  return channels;
 }
 
 async function getSecondaryAdmins(kv) {
@@ -278,7 +286,7 @@ function escapeMd(text = "") {
 }
 
 // ============================================================================
-// 4. MANDATORY FORCE-JOIN VERIFICATION ENGINE
+// 4. MANDATORY FORCE-JOIN VERIFICATION ENGINE (config:channels)
 // ============================================================================
 async function checkForceJoinMembership(ctx, kv, userId) {
   const channels = await getForceChannels(kv);
@@ -292,10 +300,13 @@ async function checkForceJoinMembership(ctx, kv, userId) {
     try {
       const member = await ctx.api.getChatMember(channelId, userId);
       if (!member || member.status === "left" || member.status === "kicked") {
-        missingChannels.push(typeof ch === "string" ? { id: ch, title: ch, inviteLink: `https://t.me/${ch.replace(/^@/, "")}` } : ch);
+        missingChannels.push(
+          typeof ch === "string"
+            ? { id: ch, title: ch, inviteLink: `https://t.me/${ch.replace(/^@/, "")}` }
+            : ch
+        );
       }
     } catch {
-      // If bot cannot verify or user is not in channel, treat as missing
       missingChannels.push(
         typeof ch === "string"
           ? { id: ch, title: ch, inviteLink: `https://t.me/${ch.replace(/^@/, "")}` }
@@ -545,8 +556,7 @@ function buildAdminRatesKeyboard(rates) {
 }
 
 function buildAdminForceChannelsKeyboard(channels) {
-  const kb = new InlineKeyboard()
-    .text("➕ Add Channel", "admin_channel_add");
+  const kb = new InlineKeyboard().text("➕ Add Channel", "admin_channel_add");
   if (channels.length > 0) {
     kb.text("➖ Remove Channel", "admin_channel_remove_menu");
   }
@@ -1027,7 +1037,7 @@ function renderAdminPayoutsView(queue) {
     .join("\n\n");
 
   pending.slice(0, 5).forEach((item) => {
-    kb.text(`✅ Approve ${item.txId} (₹${item.amountInr})`, `admin_payout_approve_${item.txId}`)
+    kb.text(`✅ Approve / Mark Paid`, `admin_payout_approve_${item.txId}`)
       .text(`❌ Reject & Refund`, `admin_payout_reject_${item.txId}`)
       .row();
   });
@@ -1072,7 +1082,7 @@ function renderAdminChannelsText(channels) {
       : "_No mandatory channels configured. Users can currently access the bot without joining any channel._";
 
   return (
-    `📢 *Manage Force-Join Channels*\n` +
+    `📢 *Manage Force-Join Channels (config:channels)*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `Users must be a member of all channels listed below before they can access \`/start\` or any bot submenu.\n\n` +
     `📋 *Active Required Channels (${channels.length}):*\n` +
@@ -1175,9 +1185,7 @@ function createBot(env) {
   const bot = new Bot(env.BOT_TOKEN);
   const kv = env.BOT_KV;
 
-  // --------------------------------------------------------------------------
   // GLOBAL ACCESS, BAN, MAINTENANCE & MANDATORY FORCE-JOIN MIDDLEWARE
-  // --------------------------------------------------------------------------
   bot.use(async (ctx, next) => {
     const from = ctx.from;
     if (!from) return next();
@@ -1203,11 +1211,10 @@ function createBot(env) {
         }
         return;
       }
-      // Admins bypass maintenance, ban, and force-join checks
       return next();
     }
 
-    // Admins bypass all restrictions on standard user flows as well
+    // Admins bypass all restrictions on standard user flows
     if (isAdmin) {
       return next();
     }
@@ -1249,7 +1256,7 @@ function createBot(env) {
       return;
     }
 
-    // 4. Mandatory Force-Join Verification (Runs before /start or any callback/message)
+    // 4. Mandatory Force-Join Verification (config:channels)
     if (callbackData === "force_join_check") {
       const check = await checkForceJoinMembership(ctx, kv, from.id);
       if (!check.passed) {
@@ -1323,9 +1330,7 @@ function createBot(env) {
     await editOrReply(ctx, renderHomeText(adminUser), buildMainMenuKeyboard());
   });
 
-  // --------------------------------------------------------------------------
   // ADMIN MODULE E: 📊 REAL-TIME PLATFORM ANALYTICS
-  // --------------------------------------------------------------------------
   bot.callbackQuery("admin_analytics", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "📊 Computing live KV analytics..." });
     const stats = await computePlatformAnalytics(kv);
@@ -1336,9 +1341,7 @@ function createBot(env) {
     await editOrReply(ctx, renderAdminAnalyticsText(stats), kb);
   });
 
-  // --------------------------------------------------------------------------
   // ADMIN MODULE A: 💳 MANAGE PAYOUTS (UPI)
-  // --------------------------------------------------------------------------
   bot.callbackQuery("admin_payouts", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "IDLE";
@@ -1371,7 +1374,6 @@ function createBot(env) {
     payout.processedBy = String(ctx.from.id);
     await savePayoutQueue(kv, queue);
 
-    // Sync user's withdrawal record in KV
     const targetUser = await getUserData(kv, payout.userId);
     const userTx = targetUser.withdrawals.find((w) => w.txId === txId);
     if (userTx) {
@@ -1379,7 +1381,6 @@ function createBot(env) {
     }
     await saveUserData(kv, targetUser);
 
-    // Notify user via private message
     try {
       await ctx.api.sendMessage(
         payout.userId,
@@ -1439,9 +1440,7 @@ function createBot(env) {
     );
   });
 
-  // --------------------------------------------------------------------------
   // ADMIN MODULE B: 🎁 SET DYNAMIC REWARD RATES
-  // --------------------------------------------------------------------------
   bot.callbackQuery("admin_rates", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "IDLE";
@@ -1513,9 +1512,7 @@ function createBot(env) {
     await editOrReply(ctx, renderAdminRatesText(rates), buildAdminRatesKeyboard(rates));
   });
 
-  // --------------------------------------------------------------------------
-  // ADMIN MODULE C: 📢 MANAGE FORCE-JOIN CHANNELS
-  // --------------------------------------------------------------------------
+  // ADMIN MODULE C: 📢 MANAGE FORCE-JOIN CHANNELS (config:channels)
   bot.callbackQuery("admin_channels", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "IDLE";
@@ -1564,7 +1561,7 @@ function createBot(env) {
     const channels = await getForceChannels(kv);
     if (idx >= 0 && idx < channels.length) {
       const removed = channels.splice(idx, 1)[0];
-      await putKvJson(kv, "config:force_channels", channels);
+      await saveForceChannels(kv, channels);
       await ctx.answerCallbackQuery({
         text: `🗑️ Channel ${removed.title || removed.id || removed} removed!`,
         show_alert: true,
@@ -1579,9 +1576,7 @@ function createBot(env) {
     );
   });
 
-  // --------------------------------------------------------------------------
-  // ADMIN MODULE D: 👥 MANAGE ADMINS
-  // --------------------------------------------------------------------------
+  // ADMIN MODULE D: 👥 MANAGE ADMINS (config:admins)
   bot.callbackQuery("admin_admins", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "IDLE";
@@ -1649,9 +1644,7 @@ function createBot(env) {
     );
   });
 
-  // --------------------------------------------------------------------------
   // ADMIN MODULE F: 📣 BROADCAST SYSTEM
-  // --------------------------------------------------------------------------
   bot.callbackQuery("admin_broadcast", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "AWAITING_BROADCAST";
@@ -1672,9 +1665,7 @@ function createBot(env) {
     );
   });
 
-  // --------------------------------------------------------------------------
   // ADMIN MODULE G: 🔍 INSPECT USER (SEARCH & EDIT)
-  // --------------------------------------------------------------------------
   bot.callbackQuery("admin_inspect", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "AWAITING_INSPECT_USER_ID";
@@ -1760,9 +1751,7 @@ function createBot(env) {
     );
   });
 
-  // --------------------------------------------------------------------------
   // ADMIN MODULE H: ⚙️ MAINTENANCE MODE
-  // --------------------------------------------------------------------------
   bot.callbackQuery("admin_maintenance", async (ctx) => {
     const maint = await getMaintenanceState(kv);
     await ctx.answerCallbackQuery();
@@ -1807,7 +1796,6 @@ function createBot(env) {
 
     user.state = "IDLE";
 
-    // Process referral payload (?start=ref_12345) for first-time users
     const payload = ctx.match ? String(ctx.match).trim() : "";
     if (isNewUser && payload.startsWith("ref_")) {
       const referrerId = payload.replace("ref_", "").trim();
@@ -2196,9 +2184,7 @@ function createBot(env) {
     const isAdmin = await isAuthorizedAdmin(kv, env, from.id);
     const text = (ctx.message?.text || "").trim();
 
-    // ------------------------------------------------------------------------
     // A. ADMIN STATEFUL INPUT HANDLERS
-    // ------------------------------------------------------------------------
     if (isAdmin && user.state.startsWith("AWAITING_") && user.state !== "AWAITING_UPI") {
       const currentState = user.state;
 
@@ -2239,7 +2225,6 @@ function createBot(env) {
             failed += 1;
           }
 
-          // Update progress every 10 users or at completion
           if ((i + 1) % 10 === 0 || i === userIds.length - 1) {
             try {
               await ctx.api.editMessageText(
@@ -2275,7 +2260,10 @@ function createBot(env) {
             : String(ctx.message.forward_from_chat.id);
           fallbackTitle = ctx.message.forward_from_chat.title;
         } else if (text) {
-          targetChatId = text.startsWith("@") || text.startsWith("-100") ? text.split(/\s+/)[0] : `@${text.split(/\s+/)[0]}`;
+          targetChatId =
+            text.startsWith("@") || text.startsWith("-100")
+              ? text.split(/\s+/)[0]
+              : `@${text.split(/\s+/)[0]}`;
         }
 
         if (!targetChatId) {
@@ -2309,7 +2297,7 @@ function createBot(env) {
               title: chatInfo.title || fallbackTitle || normalizedId,
               inviteLink,
             });
-            await putKvJson(kv, "config:force_channels", channels);
+            await saveForceChannels(kv, channels);
           }
 
           user.state = "IDLE";
@@ -2432,7 +2420,6 @@ function createBot(env) {
         payout.processedBy = String(from.id);
         await savePayoutQueue(kv, queue);
 
-        // Refund full amount to user's wallet in KV
         const targetUser = await getUserData(kv, payout.userId);
         targetUser.balanceInr += Number(payout.amountInr);
         const userTx = targetUser.withdrawals.find((w) => w.txId === txId);
@@ -2442,7 +2429,6 @@ function createBot(env) {
         }
         await saveUserData(kv, targetUser);
 
-        // Notify user with rejection reason & refund confirmation
         try {
           await ctx.api.sendMessage(
             payout.userId,
@@ -2537,9 +2523,7 @@ function createBot(env) {
       }
     }
 
-    // ------------------------------------------------------------------------
     // B. USER STATEFUL UPI WITHDRAWAL INPUT (AWAITING_UPI)
-    // ------------------------------------------------------------------------
     if (user.state === "AWAITING_UPI") {
       const rates = await getDynamicRates(kv);
       const tokens = text.split(/\s+/);
@@ -2578,7 +2562,6 @@ function createBot(env) {
       const txId = `UPI-${Date.now().toString(36).toUpperCase()}`;
       const timestamp = new Date().toISOString();
 
-      // Deduct balance to 0 & reset state
       user.balanceInr = 0;
       user.state = "IDLE";
       const withdrawalEntry = {
@@ -2595,12 +2578,10 @@ function createBot(env) {
       user.withdrawals.unshift(withdrawalEntry);
       await saveUserData(kv, user);
 
-      // Enqueue into global admin payout queue (config:payout_queue)
       const queue = await getPayoutQueue(kv);
       queue.unshift(withdrawalEntry);
       await savePayoutQueue(kv, queue);
 
-      // Forward interactive transaction alert to env.ADMIN_CHAT_ID
       if (env.ADMIN_CHAT_ID) {
         const adminAlert =
           `🚨 *NEW UPI WITHDRAWAL REQUEST*\n` +
@@ -2616,7 +2597,7 @@ function createBot(env) {
           `━━━━━━━━━━━━━━━━━━━━━━`;
 
         const adminActionKb = new InlineKeyboard()
-          .text(`✅ Approve & Mark Paid`, `admin_payout_approve_${txId}`)
+          .text(`✅ Approve / Mark Paid`, `admin_payout_approve_${txId}`)
           .text(`❌ Reject & Refund`, `admin_payout_reject_${txId}`);
 
         try {
@@ -2654,7 +2635,6 @@ function createBot(env) {
       return;
     }
 
-    // Default fallback for unexpected messages: always render inline dashboard
     await ctx.reply(renderHomeText(user), {
       parse_mode: "Markdown",
       reply_markup: buildMainMenuKeyboard(),
@@ -2677,6 +2657,7 @@ export default {
       return new Response(
         JSON.stringify({
           ok: true,
+          worker: "gmailworkop",
           service: "grammY Telegram Task & UPI Bot + Enterprise Admin Panel (Cloudflare Workers)",
           kvBound: Boolean(env.BOT_KV),
           botTokenConfigured: Boolean(env.BOT_TOKEN),

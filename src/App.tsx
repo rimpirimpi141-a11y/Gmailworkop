@@ -179,7 +179,7 @@ export default function App() {
 
   // Webhook URL generator inputs
   const [webhookBotToken, setWebhookBotToken] = useState<string>('7182930412:AAH_your_telegram_bot_token_here');
-  const [webhookWorkerUrl, setWebhookWorkerUrl] = useState<string>('https://grammy-telegram-task-bot.your-subdomain.workers.dev');
+  const [webhookWorkerUrl, setWebhookWorkerUrl] = useState<string>('https://gmailworkop.your-subdomain.workers.dev');
 
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
 
