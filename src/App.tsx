@@ -8,8 +8,6 @@ import {
   Database,
   MessageSquare,
   ExternalLink,
-  PlusCircle,
-  ArrowUpRight,
   ShieldAlert,
   UserCheck,
   Lock,
@@ -27,7 +25,6 @@ import {
   BotUserSchema,
   GlobalKvConfig,
   InlineKeyboardGrid,
-  AdminChannelAlert,
 } from './botEngine';
 
 interface ChatMessage {
@@ -39,8 +36,8 @@ interface ChatMessage {
   editedAt?: string;
 }
 
-const KV_USER_STORAGE_KEY = 'grammy_worker_bot_kv_user_v2';
-const KV_GLOBAL_STORAGE_KEY = 'grammy_worker_bot_kv_global_v2';
+const KV_USER_STORAGE_KEY = 'grammy_worker_bot_kv_user_v4';
+const KV_GLOBAL_STORAGE_KEY = 'grammy_worker_bot_kv_global_v4';
 
 // Helper to render Telegram-style Markdown (*bold*, _italic_, `code`) cleanly in JSX
 function renderTelegramMarkdown(text: string, onCopyCode?: (val: string) => void) {
@@ -123,6 +120,7 @@ export default function App() {
   const [isAdminRole, setIsAdminRole] = useState<boolean>(true);
   const [hasJoinedForceChannels, setHasJoinedForceChannels] = useState<boolean>(true);
   const [kvInspectorView, setKvInspectorView] = useState<'global' | 'user'>('global');
+  const [queuePanelTab, setQueuePanelTab] = useState<'custom' | 'tasks' | 'payouts'>('custom');
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const initial = createInitialUser();
@@ -137,13 +135,12 @@ export default function App() {
         id: 'msg-init-2',
         sender: 'bot',
         text: renderHomeText(initial),
-        keyboard: buildMainMenuKeyboard(),
+        keyboard: buildMainMenuKeyboard(true),
         timestamp: '21:35:01',
       },
     ];
   });
 
-  const [lastCallbackData, setLastCallbackData] = useState<string>('/start');
   const [chatInput, setChatInput] = useState<string>('');
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<'sandbox' | 'code' | 'kv' | 'deploy'>('sandbox');
   const [selectedCodeFile, setSelectedCodeFile] = useState<'worker.js' | 'wrangler.toml' | 'package.json'>('worker.js');
@@ -151,31 +148,6 @@ export default function App() {
 
   // Telegram answerCallbackQuery popup/toast state
   const [tgPopup, setTgPopup] = useState<{ text: string; showAlert: boolean } | null>(null);
-
-  // Admin channel alerts (env.ADMIN_CHAT_ID)
-  const [adminAlerts, setAdminAlerts] = useState<AdminChannelAlert[]>([
-    {
-      id: 'UPI-P84K19X',
-      txId: 'UPI-P84K19X',
-      userId: '749201842',
-      userName: 'Aarav (@aarav_dev)',
-      amountInr: 50,
-      upiId: 'aarav.dev@okaxis',
-      holderName: 'Aarav Sharma',
-      timestamp: '2026-10-25T19:20:00.000Z',
-      status: 'PROCESSING',
-      rawMarkdown:
-        `🚨 *NEW UPI WITHDRAWAL REQUEST*\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `🆔 *Transaction ID:* \`UPI-P84K19X\`\n` +
-        `👤 *User:* Aarav (@aarav_dev)\n` +
-        `🔢 *User ID:* \`749201842\`\n` +
-        `💰 *Payout Amount:* *₹50.00*\n` +
-        `🏦 *UPI Handle:* \`aarav.dev@okaxis\`\n` +
-        `🪪 *Account Holder:* \`Aarav Sharma\`\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━`,
-    },
-  ]);
 
   // Webhook URL generator inputs
   const [webhookBotToken, setWebhookBotToken] = useState<string>('7182930412:AAH_your_telegram_bot_token_here');
@@ -223,9 +195,8 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleInlineButtonClick = (callbackData?: string, url?: string) => {
+  const handleInlineButtonClick = (callbackData?: string, url?: string, overrideAdmin?: boolean) => {
     if (url) {
-      // If clicking a Force-Join channel link in the simulator, automatically mark as joined for easy testing!
       if (!hasJoinedForceChannels) {
         setHasJoinedForceChannels(true);
         setTgPopup({
@@ -244,12 +215,12 @@ export default function App() {
 
     if (!callbackData) return;
 
-    setLastCallbackData(callbackData);
+    const effectiveAdmin = overrideAdmin ?? isAdminRole;
     const { updatedUser, updatedKv, result } = dispatchCallbackQuery(
       callbackData,
       user,
       globalKv,
-      { isAdminRole, hasJoinedForceChannels }
+      { isAdminRole: effectiveAdmin, hasJoinedForceChannels }
     );
     setUser(updatedUser);
     setGlobalKv(updatedKv);
@@ -289,11 +260,12 @@ export default function App() {
     }
   };
 
-  const handleSendTextMessage = (e?: React.FormEvent, customText?: string) => {
+  const handleSendTextMessage = (e?: React.FormEvent, customText?: string, overrideAdmin?: boolean) => {
     if (e) e.preventDefault();
     const textToSend = (customText ?? chatInput).trim();
     if (!textToSend) return;
 
+    const effectiveAdmin = overrideAdmin ?? isAdminRole;
     const nowTime = new Date().toTimeString().slice(0, 8);
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -306,11 +278,10 @@ export default function App() {
       textToSend,
       user,
       globalKv,
-      { isAdminRole, hasJoinedForceChannels }
+      { isAdminRole: effectiveAdmin, hasJoinedForceChannels }
     );
     setUser(updatedUser);
     setGlobalKv(updatedKv);
-    setLastCallbackData(`message ("${textToSend}")`);
 
     const botMsg: ChatMessage = {
       id: `bot-${Date.now() + 1}`,
@@ -323,16 +294,19 @@ export default function App() {
     setMessages((prev) => [...prev, userMsg, botMsg]);
     if (!customText) setChatInput('');
 
-    if (result.adminAlert) {
-      setAdminAlerts((prev) => [result.adminAlert!, ...prev]);
-    }
-
     if (result.toast) {
       setTgPopup(result.toast);
       if (!result.toast.showAlert) {
         setTimeout(() => setTgPopup(null), 3000);
       }
     }
+  };
+
+  const handleToggleAdminRole = () => {
+    const nextAdmin = !isAdminRole;
+    setIsAdminRole(nextAdmin);
+    // Refresh main menu so the dynamic 🛡️ Admin Panel button updates immediately
+    handleInlineButtonClick('menu_home', undefined, nextAdmin);
   };
 
   const handleTestForceJoinFlow = () => {
@@ -347,7 +321,6 @@ export default function App() {
     );
     setUser(updatedUser);
     setGlobalKv(updatedKv);
-    setLastCallbackData('force_join_gate');
     setMessages((prev) => [
       ...prev,
       { id: `u-${Date.now()}`, sender: 'user', text: '/start', timestamp: nowTime },
@@ -368,7 +341,6 @@ export default function App() {
     setGlobalKv(freshKv);
     setIsAdminRole(true);
     setHasJoinedForceChannels(true);
-    setLastCallbackData('/start');
     const nowTime = new Date().toTimeString().slice(0, 8);
     setMessages([
       {
@@ -381,7 +353,7 @@ export default function App() {
         id: `reset-bot-${Date.now() + 1}`,
         sender: 'bot',
         text: renderHomeText(freshUser),
-        keyboard: buildMainMenuKeyboard(),
+        keyboard: buildMainMenuKeyboard(true),
         timestamp: nowTime,
       },
     ]);
@@ -398,8 +370,10 @@ export default function App() {
     webhookWorkerUrl.trim()
   )}"`;
 
-  const pendingPayoutsCount = globalKv.payoutQueue.filter(
-    (p) => p.status === 'PROCESSING'
+  const pendingTasksCount = globalKv.taskReviewQueue.filter((t) => t.status === 'PENDING').length;
+  const pendingPayoutsCount = globalKv.payoutQueue.filter((p) => p.status === 'PROCESSING').length;
+  const activeCustomTasksCount = (globalKv.adminTasks || []).filter(
+    (t) => Number(t.remainingSlots) > 0
   ).length;
 
   return (
@@ -488,35 +462,35 @@ export default function App() {
       <section className="border-b border-slate-800 bg-[#131C31] px-6 py-3">
         <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-4">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
-            <span className="text-slate-200 font-medium">Enterprise Admin + Force-Join Engine</span>
+            <span className="text-slate-200 font-medium">Custom Admin Tasks + Users Directory + Factory Reset</span>
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums text-sky-300">
               State: {user.state}
             </span>
             <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">
-              Task Rate: ₹{globalKv.rates.taskRewardInr}
+            <span className="font-mono tabular-nums text-emerald-300">
+              Admin Tasks: {activeCustomTasksCount}
             </span>
             <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">
-              Maintenance: {globalKv.maintenance.enabled ? 'ON' : 'OFF'}
+            <span className="font-mono tabular-nums text-amber-300">
+              Pending Reviews: {pendingTasksCount}
             </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {/* Role Toggle (Admin vs Regular User) */}
+            {/* Role Toggle (Admin vs Regular User — dynamically toggles 🛡️ Admin Panel button on Main Menu) */}
             <button
               type="button"
-              onClick={() => setIsAdminRole((prev) => !prev)}
+              onClick={handleToggleAdminRole}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 isAdminRole
                   ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
                   : 'bg-slate-900 text-slate-300 border-slate-800 hover:text-white'
               }`}
-              title="Toggle whether your simulated Telegram account is an authorized Admin"
+              title="Toggle whether your simulated Telegram account is an authorized Admin (controls 🛡️ Admin Panel button on Main Menu)"
             >
               <ShieldAlert className="w-3.5 h-3.5" />
-              Role: {isAdminRole ? 'Super Admin (Bypass On)' : 'Regular User'}
+              Role: {isAdminRole ? 'Super Admin (Shows 🛡️ Admin Button)' : 'Regular User (Hides Admin Button)'}
             </button>
 
             {/* Force-Join Membership Simulator Toggle */}
@@ -528,7 +502,7 @@ export default function App() {
                   ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
                   : 'bg-amber-500/15 text-amber-300 border-amber-500/40'
               }`}
-              title="Simulate getChatMember status for config:force_channels"
+              title="Simulate getChatMember status for config:channels"
             >
               <UserCheck className="w-3.5 h-3.5" />
               Channels: {hasJoinedForceChannels ? 'Joined' : 'Not Joined'}
@@ -540,18 +514,18 @@ export default function App() {
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Lock className="w-3.5 h-3.5" />
-              Test Force-Join Gate
+              Test Force-Join
             </button>
 
             <button
               type="button"
               onClick={() => {
                 setIsAdminRole(true);
-                handleSendTextMessage(undefined, '/admin');
+                handleInlineButtonClick('admin_home', undefined, true);
               }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              Open /admin Panel
+              🛡️ Admin Panel
             </button>
 
             <button
@@ -560,7 +534,7 @@ export default function App() {
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              Reset KV
+              Reload Demo Data
             </button>
           </div>
         </div>
@@ -585,7 +559,7 @@ export default function App() {
                       Gmail Task Hub Bot
                     </div>
                     <div className="text-xs text-slate-400 truncate">
-                      @GmailTaskRewardsBot · /start & /admin
+                      @GmailTaskRewardsBot · Custom Tasks + Admin Suite
                     </div>
                   </div>
                 </div>
@@ -601,7 +575,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setIsAdminRole(true);
-                      handleSendTextMessage(undefined, '/admin');
+                      handleSendTextMessage(undefined, '/admin', true);
                     }}
                     className="px-2.5 py-1 text-xs font-semibold text-emerald-300 bg-emerald-950/80 hover:bg-emerald-900/80 border border-emerald-700/50 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
@@ -614,20 +588,19 @@ export default function App() {
               <div className="px-3 py-2 bg-[#131C27] border-b border-slate-800/80 flex items-center gap-1.5 overflow-x-auto">
                 <span className="text-[11px] text-slate-400 shrink-0 mr-1">Jump:</span>
                 {[
-                  { label: '🛡️ /admin', cb: 'admin_home', forceAdmin: true },
-                  { label: '💳 Payouts', cb: 'admin_payouts', forceAdmin: true },
-                  { label: '🎁 Rates', cb: 'admin_rates', forceAdmin: true },
-                  { label: '📢 Channels', cb: 'admin_channels', forceAdmin: true },
-                  { label: '🏠 /start', cb: 'menu_home', forceAdmin: false },
-                  { label: '📩 Register', cb: 'menu_register', forceAdmin: false },
-                  { label: '👛 Balance', cb: 'menu_balance', forceAdmin: false },
+                  { label: '🏠 Home', cb: 'menu_home', forceAdmin: false },
+                  { label: '📩 Register Task', cb: 'menu_register', forceAdmin: false },
+                  { label: '➕ Add Task', cb: 'admin_task_add', forceAdmin: true },
+                  { label: '👥 All Users', cb: 'admin_users_list', forceAdmin: true },
+                  { label: '📝 Task Queue', cb: 'admin_tasks_queue', forceAdmin: true },
+                  { label: '⚠️ Wipe Data', cb: 'admin_system_reset', forceAdmin: true },
                 ].map((item) => (
                   <button
                     key={item.cb}
                     type="button"
                     onClick={() => {
                       if (item.forceAdmin) setIsAdminRole(true);
-                      handleInlineButtonClick(item.cb);
+                      handleInlineButtonClick(item.cb, undefined, item.forceAdmin ? true : undefined);
                     }}
                     className="px-2 py-1 text-[11px] font-medium text-slate-300 hover:text-white bg-slate-800/70 hover:bg-slate-700/80 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
@@ -742,6 +715,77 @@ export default function App() {
                   <span className="truncate font-mono">
                     State: <strong>{user.state}</strong>
                   </span>
+                  {user.state === 'AWAITING_NEWTASK_EMAIL' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(undefined, 'roshan.work####@gmail.com')
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Pattern: roshan.work####@gmail.com
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_NEWTASK_PASSWORD' && (
+                    <button
+                      type="button"
+                      onClick={() => handleSendTextMessage(undefined, 'SecurePass@2026')}
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Password: SecurePass@2026
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_NEWTASK_REWARD' && (
+                    <button
+                      type="button"
+                      onClick={() => handleSendTextMessage(undefined, '25')}
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Reward: ₹25
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_NEWTASK_SLOTS' && (
+                    <button
+                      type="button"
+                      onClick={() => handleSendTextMessage(undefined, '10')}
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Quantity: 10 Slots
+                    </button>
+                  )}
+                  {(user.state === 'AWAITING_USER_SUBMIT_GMAIL' ||
+                    user.state === 'AWAITING_2FA_CODES') && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(
+                          undefined,
+                          user.currentTask?.taskType === '2-Step Gmail'
+                            ? `${user.currentTask?.email || 'roshan.work2026@gmail.com'} 49201842 83910492`
+                            : `${user.currentTask?.email || 'customname4821@gmail.com'}`
+                        )
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      {user.currentTask?.taskType === '2-Step Gmail'
+                        ? 'Send Gmail + 2FA Codes'
+                        : 'Send Created Gmail'}
+                    </button>
+                  )}
+                  {user.state === 'AWAITING_TASK_REJECT_REASON' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendTextMessage(
+                          undefined,
+                          'User remained logged in on phone during admin check'
+                        )
+                      }
+                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Send Sample Reject Reason
+                    </button>
+                  )}
                   {user.state === 'AWAITING_UPI' && (
                     <button
                       type="button"
@@ -764,7 +808,7 @@ export default function App() {
                       }
                       className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
-                      Send Sample Reason
+                      Send Sample UPI Reason
                     </button>
                   )}
                   {user.state === 'AWAITING_FORCE_CHANNEL' && (
@@ -776,20 +820,6 @@ export default function App() {
                       className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       Send @TelegramPayoutProofs
-                    </button>
-                  )}
-                  {user.state === 'AWAITING_BROADCAST' && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handleSendTextMessage(
-                          undefined,
-                          '🔥 *Weekend Bonus Alert!* Task rewards have been boosted! Complete 5 tasks today for instant UPI payouts.'
-                        )
-                      }
-                      className="px-2 py-1 bg-amber-400 text-slate-950 font-semibold rounded text-[11px] hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      Send Sample Broadcast
                     </button>
                   )}
                 </div>
@@ -821,7 +851,7 @@ export default function App() {
               </form>
             </div>
 
-            {/* RIGHT 7 COLUMNS: KV STATE INSPECTOR, ADMIN QUEUE & SOURCE CODE */}
+            {/* RIGHT 7 COLUMNS: KV STATE INSPECTOR, ADMIN CUSTOM TASKS & SOURCE CODE */}
             <div className="lg:col-span-7 space-y-6">
               {/* Top KPI Strip (Tabular Numerals, Single-Elevation Surface) */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
@@ -831,42 +861,42 @@ export default function App() {
                     ₹{user.balanceInr.toFixed(2)}
                   </div>
                   <div className="mt-1 text-[11px] text-slate-400 font-mono tabular-nums">
-                    Min Withdraw: ₹{globalKv.rates.minWithdrawalInr.toFixed(2)}
+                    Approved: {user.accounts.approved} | Pending: {user.accounts.pending}
                   </div>
                 </div>
 
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Dynamic Task Rate</div>
+                  <div className="text-xs text-slate-400">Admin Custom Tasks</div>
                   <div className="mt-1 text-xl font-bold text-emerald-400 font-mono tabular-nums">
-                    ₹{globalKv.rates.taskRewardInr.toFixed(2)}
+                    {activeCustomTasksCount} active
                   </div>
-                  <div className="mt-1 text-[11px] text-slate-400 font-mono tabular-nums">
-                    Referral: ₹{globalKv.rates.referralBonusInr.toFixed(2)}
+                  <div className="mt-1 text-[11px] text-slate-400 truncate">
+                    config:admin_tasks
                   </div>
                 </div>
 
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Pending UPI Queue</div>
+                  <div className="text-xs text-slate-400">Task Review Queue</div>
                   <div className="mt-1 text-xl font-bold text-amber-400 font-mono tabular-nums">
-                    {pendingPayoutsCount} tx
+                    {pendingTasksCount} pending
                   </div>
                   <div className="mt-1 text-[11px] text-slate-400 truncate">
-                    config:payout_queue
+                    config:task_review_queue
                   </div>
                 </div>
 
                 <div className="p-4 bg-[#1E293B] border border-slate-800 rounded-xl">
-                  <div className="text-xs text-slate-400">Force Channels</div>
+                  <div className="text-xs text-slate-400">Registered Users</div>
                   <div className="mt-1 text-xl font-bold text-sky-400 font-mono tabular-nums">
-                    {globalKv.forceChannels.length} active
+                    {globalKv.usersIndex.length} users
                   </div>
                   <div className="mt-1 text-[11px] text-slate-400 truncate">
-                    Sub-Admins: {globalKv.admins.length}
+                    config:users_index
                   </div>
                 </div>
               </div>
 
-              {/* Live Cloudflare Workers KV (env.BOT_KV) & Admin Payout Queue Split */}
+              {/* Live Cloudflare Workers KV (env.BOT_KV) & Admin Queues Split */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {/* Live KV JSON State Viewer */}
                 <div className="bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[320px]">
@@ -932,83 +962,229 @@ export default function App() {
                   </pre>
                 </div>
 
-                {/* Live Payout Queue & Admin Channel Feed */}
+                {/* Live Custom Tasks, Task Review Queue & UPI Payout Queue */}
                 <div className="bg-[#1E293B] border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[320px]">
-                  <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                      <MessageSquare className="w-4 h-4 text-emerald-400" />
-                      <span>UPI Payout Queue (`config:payout_queue`)</span>
+                  <div className="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <MessageSquare className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <button
+                        type="button"
+                        onClick={() => setQueuePanelTab('custom')}
+                        className={`px-2 py-0.5 text-[11px] font-medium rounded cursor-pointer ${
+                          queuePanelTab === 'custom'
+                            ? 'bg-emerald-400 text-slate-950 font-semibold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Admin Tasks ({activeCustomTasksCount})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setQueuePanelTab('tasks')}
+                        className={`px-2 py-0.5 text-[11px] font-medium rounded cursor-pointer ${
+                          queuePanelTab === 'tasks'
+                            ? 'bg-emerald-400 text-slate-950 font-semibold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Reviews ({pendingTasksCount})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setQueuePanelTab('payouts')}
+                        className={`px-2 py-0.5 text-[11px] font-medium rounded cursor-pointer ${
+                          queuePanelTab === 'payouts'
+                            ? 'bg-emerald-400 text-slate-950 font-semibold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Payouts ({pendingPayoutsCount})
+                      </button>
                     </div>
                     <button
                       type="button"
                       onClick={() => {
                         setIsAdminRole(true);
-                        handleInlineButtonClick('admin_payouts');
+                        handleInlineButtonClick(
+                          queuePanelTab === 'custom'
+                            ? 'admin_tasks_manage'
+                            : queuePanelTab === 'tasks'
+                            ? 'admin_tasks_queue'
+                            : 'admin_payouts',
+                          undefined,
+                          true
+                        );
                       }}
-                      className="text-[11px] text-sky-300 hover:text-sky-200 font-medium cursor-pointer"
+                      className="text-[11px] text-sky-300 hover:text-sky-200 font-medium cursor-pointer whitespace-nowrap"
                     >
-                      Manage in Chat →
+                      Open in Chat →
                     </button>
                   </div>
+
                   <div className="flex-1 p-3.5 overflow-y-auto space-y-2.5 bg-[#0B1120]">
-                    {globalKv.payoutQueue.map((item) => (
-                      <div
-                        key={item.txId}
-                        className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs space-y-1.5"
-                      >
-                        <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
-                          <span className="text-white font-semibold">{item.txId}</span>
-                          <span
-                            className={
-                              item.status === 'COMPLETED'
-                                ? 'text-emerald-400'
-                                : item.status === 'REJECTED'
-                                ? 'text-rose-400'
-                                : 'text-amber-400'
-                            }
+                    {queuePanelTab === 'custom' ? (
+                      (globalKv.adminTasks || []).length > 0 ? (
+                        (globalKv.adminTasks || []).map((t) => (
+                          <div
+                            key={t.customTaskId}
+                            className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs space-y-1.5"
                           >
-                            {item.status}
-                          </span>
-                        </div>
-                        <div className="text-slate-200 font-mono tabular-nums">
-                          ₹{item.amountInr.toFixed(2)} →{' '}
-                          <span className="text-sky-300">{item.upiId}</span> ({item.holderName})
-                        </div>
-                        {item.rejectReason && (
-                          <div className="text-[11px] text-rose-300">
-                            Reason: {item.rejectReason}
+                            <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
+                              <span className="text-white font-semibold">
+                                {t.customTaskId} · {t.taskType}
+                              </span>
+                              <span className="text-emerald-400">
+                                Slots: {t.remainingSlots}/{t.totalSlots}
+                              </span>
+                            </div>
+                            <div className="text-slate-200 font-mono tabular-nums truncate">
+                              Pattern: <span className="text-sky-300">{t.emailPattern}</span>
+                            </div>
+                            <div className="text-slate-300 font-mono tabular-nums flex items-center justify-between">
+                              <span>Pass: {t.password}</span>
+                              <span className="text-emerald-300 font-semibold">₹{t.rewardInr}</span>
+                            </div>
                           </div>
-                        )}
-                        {item.status === 'PROCESSING' && (
-                          <div className="flex items-center gap-2 pt-1">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsAdminRole(true);
-                                handleInlineButtonClick(
-                                  `admin_payout_approve_${item.txId}`
-                                );
-                              }}
-                              className="px-2 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 rounded text-[11px] font-medium cursor-pointer"
+                        ))
+                      ) : (
+                        <div className="text-xs text-slate-400 p-4 text-center">
+                          No active custom tasks in <code>config:admin_tasks</code>. Click{' '}
+                          <strong>➕ Add Task</strong> in the Admin Panel to create one!
+                        </div>
+                      )
+                    ) : queuePanelTab === 'tasks' ? (
+                      globalKv.taskReviewQueue.map((item) => (
+                        <div
+                          key={item.taskId}
+                          className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
+                            <span className="text-white font-semibold">
+                              {item.taskId} · {item.taskType}
+                            </span>
+                            <span
+                              className={
+                                item.status === 'APPROVED'
+                                  ? 'text-emerald-400'
+                                  : item.status === 'REJECTED'
+                                  ? 'text-rose-400'
+                                  : 'text-amber-400'
+                              }
                             >
-                              ✅ Approve & Mark Paid
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsAdminRole(true);
-                                handleInlineButtonClick(
-                                  `admin_payout_reject_${item.txId}`
-                                );
-                              }}
-                              className="px-2 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 rounded text-[11px] font-medium cursor-pointer"
-                            >
-                              ❌ Reject & Refund
-                            </button>
+                              {item.status}
+                            </span>
                           </div>
-                        )}
-                      </div>
-                    ))}
+                          <div className="text-slate-200 font-mono tabular-nums truncate">
+                            {item.email} · <span className="text-emerald-300">₹{item.rewardInr}</span>
+                          </div>
+                          {item.twoFactorData && (
+                            <div className="text-[11px] text-sky-300 font-mono truncate">
+                              2FA: {item.twoFactorData}
+                            </div>
+                          )}
+                          {item.rejectReason && (
+                            <div className="text-[11px] text-rose-300">
+                              Reason: {item.rejectReason}
+                            </div>
+                          )}
+                          {item.status === 'PENDING' && (
+                            <div className="flex items-center gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsAdminRole(true);
+                                  handleInlineButtonClick(
+                                    `admin_task_approve_${item.taskId}`,
+                                    undefined,
+                                    true
+                                  );
+                                }}
+                                className="px-2 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 rounded text-[11px] font-medium cursor-pointer"
+                              >
+                                ✅ Approve & Pay
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsAdminRole(true);
+                                  handleInlineButtonClick(
+                                    `admin_task_reject_${item.taskId}`,
+                                    undefined,
+                                    true
+                                  );
+                                }}
+                                className="px-2 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 rounded text-[11px] font-medium cursor-pointer"
+                              >
+                                ❌ Reject Task
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      globalKv.payoutQueue.map((item) => (
+                        <div
+                          key={item.txId}
+                          className="p-3 rounded-lg bg-slate-900 border border-slate-800 text-xs space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
+                            <span className="text-white font-semibold">{item.txId}</span>
+                            <span
+                              className={
+                                item.status === 'COMPLETED'
+                                  ? 'text-emerald-400'
+                                  : item.status === 'REJECTED'
+                                  ? 'text-rose-400'
+                                  : 'text-amber-400'
+                              }
+                            >
+                              {item.status}
+                            </span>
+                          </div>
+                          <div className="text-slate-200 font-mono tabular-nums">
+                            ₹{item.amountInr.toFixed(2)} →{' '}
+                            <span className="text-sky-300">{item.upiId}</span> ({item.holderName})
+                          </div>
+                          {item.rejectReason && (
+                            <div className="text-[11px] text-rose-300">
+                              Reason: {item.rejectReason}
+                            </div>
+                          )}
+                          {item.status === 'PROCESSING' && (
+                            <div className="flex items-center gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsAdminRole(true);
+                                  handleInlineButtonClick(
+                                    `admin_payout_approve_${item.txId}`,
+                                    undefined,
+                                    true
+                                  );
+                                }}
+                                className="px-2 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 rounded text-[11px] font-medium cursor-pointer"
+                              >
+                                ✅ Approve & Mark Paid
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsAdminRole(true);
+                                  handleInlineButtonClick(
+                                    `admin_payout_reject_${item.txId}`,
+                                    undefined,
+                                    true
+                                  );
+                                }}
+                                className="px-2 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 rounded text-[11px] font-medium cursor-pointer"
+                              >
+                                ❌ Reject & Refund
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
               </div>
@@ -1091,10 +1267,10 @@ export default function App() {
             <div className="px-6 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h1 className="text-lg font-bold text-white font-display">
-                  Complete Upgraded Cloudflare Worker (`worker.js`)
+                  Complete Upgraded Cloudflare Worker (`worker.js` / `index.js`)
                 </h1>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Includes full user flows + <code className="text-sky-300">/admin</code> Enterprise Dashboard + Mandatory Force-Join middleware via <code className="text-sky-300">env.BOT_KV</code>.
+                  Includes Manual Add Task Wizard (<code className="text-sky-300">config:admin_tasks</code>), Paginated Users List (<code className="text-sky-300">admin_users_list</code>), Factory Reset (<code className="text-sky-300">admin_system_reset</code>), Manual Task Verification Queue, and 2FA Tasks.
                 </p>
               </div>
 
@@ -1160,7 +1336,7 @@ export default function App() {
                   Cloudflare KV Namespace (`env.BOT_KV`)
                 </h2>
                 <p className="text-xs text-slate-400 mt-1">
-                  Inspect and test all dynamic keys (`config:rates`, `config:force_channels`, `config:admins`, `config:maintenance`, `config:payout_queue`, and `user:{user.userId}`).
+                  Inspect and test all dynamic keys (`config:admin_tasks`, `config:task_review_queue`, `config:users_index`, `config:rates`, `config:channels`, `config:admins`, `config:maintenance`, `config:payout_queue`, and `user:{user.userId}`).
                 </p>
               </div>
 
@@ -1170,18 +1346,20 @@ export default function App() {
                   <code className="text-sky-300 font-mono">{globalKv.superAdminId}</code>
                 </div>
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
-                  <span className="text-slate-400">Secondary Admins (`config:admins`)</span>
-                  <span className="font-mono text-white">{globalKv.admins.length}</span>
-                </div>
-                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
-                  <span className="text-slate-400">Force Channels (`config:force_channels`)</span>
-                  <span className="font-mono text-sky-300">{globalKv.forceChannels.length}</span>
-                </div>
-                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
-                  <span className="text-slate-400">Maintenance (`config:maintenance`)</span>
-                  <span className="font-mono font-semibold text-amber-300">
-                    {globalKv.maintenance.enabled ? 'ENABLED' : 'DISABLED'}
+                  <span className="text-slate-400">Custom Admin Tasks (`config:admin_tasks`)</span>
+                  <span className="font-mono text-emerald-300">
+                    {activeCustomTasksCount} active
                   </span>
+                </div>
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">Task Review Queue (`config:task_review_queue`)</span>
+                  <span className="font-mono text-amber-300">
+                    {pendingTasksCount} pending / {globalKv.taskReviewQueue.length} total
+                  </span>
+                </div>
+                <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
+                  <span className="text-slate-400">Registered Users (`config:users_index`)</span>
+                  <span className="font-mono text-sky-300">{globalKv.usersIndex.length} users</span>
                 </div>
                 <div className="flex items-center justify-between py-1.5 border-b border-slate-800/70">
                   <span className="text-slate-400">User Session State</span>
@@ -1224,7 +1402,7 @@ export default function App() {
                   onClick={handleResetKvState}
                   className="col-span-2 px-3 py-2 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-rose-300 border border-slate-800 rounded-lg cursor-pointer transition-colors"
                 >
-                  Reset All KV Keys to Defaults
+                  Reload Initial Demo KV Data
                 </button>
               </div>
             </div>

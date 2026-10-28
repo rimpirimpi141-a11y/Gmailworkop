@@ -5,13 +5,15 @@
  * Storage: Cloudflare Workers KV (env.BOT_KV)
  *
  * KV Keys Architecture:
- * - user:<userId>          -> User profile, wallet, tasks, referrals, withdrawals, state, adminContext, isBanned
- * - config:admins          -> JSON array of secondary admin objects [{ id, addedBy, addedAt }]
- * - config:channels        -> JSON array of required force-join channels [{ id, title, inviteLink }]
- * - config:rates           -> JSON object { taskRewardInr, taskRewardUsd, minWithdrawalInr, referralBonusInr, dailyStreakBaseInr }
- * - config:maintenance     -> JSON object { enabled: boolean, updatedAt: string, updatedBy: string }
- * - config:users_index     -> JSON array of all registered userId strings ["749201842", ...]
- * - config:payout_queue    -> JSON array of pending & processed withdrawal requests across the platform
+ * - user:<userId>              -> User profile, wallet, tasks, referrals, withdrawals, state, adminContext, isBanned
+ * - config:admins              -> JSON array of secondary admin objects [{ id, addedBy, addedAt }]
+ * - config:channels            -> JSON array of required force-join channels [{ id, title, inviteLink }]
+ * - config:rates               -> JSON object { standardTaskInr, twoFactorTaskInr, taskRewardInr, minWithdrawalInr, referralBonusInr, dailyStreakBaseInr }
+ * - config:maintenance         -> JSON object { enabled: boolean, updatedAt: string, updatedBy: string }
+ * - config:users_index         -> JSON array of all registered userId strings ["749201842", ...]
+ * - config:admin_tasks         -> JSON array of Admin-created custom tasks [{ customTaskId, taskType, emailPattern, password, rewardInr, totalSlots, remainingSlots, completedSlots, createdAt }]
+ * - config:task_review_queue   -> JSON array of submitted Gmail tasks (PENDING, APPROVED, REJECTED)
+ * - config:payout_queue        -> JSON array of pending & processed UPI withdrawal requests across the platform
  */
 
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
@@ -20,6 +22,10 @@ import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 // 1. DEFAULT CONSTANTS & MILESTONES
 // ============================================================================
 const DEFAULT_RATES = {
+  standardTaskInr: 15,
+  standardTaskUsd: 0.20,
+  twoFactorTaskInr: 30,
+  twoFactorTaskUsd: 0.40,
   taskRewardInr: 15,
   taskRewardUsd: 0.20,
   minWithdrawalInr: 50,
@@ -69,10 +75,19 @@ async function getDynamicRates(kv) {
     await putKvJson(kv, "config:rates", DEFAULT_RATES);
     return { ...DEFAULT_RATES };
   }
-  const taskRewardInr = Number(stored.taskRewardInr ?? DEFAULT_RATES.taskRewardInr);
+  const standardTaskInr = Number(
+    stored.standardTaskInr ?? stored.taskRewardInr ?? DEFAULT_RATES.standardTaskInr
+  );
+  const twoFactorTaskInr = Number(
+    stored.twoFactorTaskInr ?? DEFAULT_RATES.twoFactorTaskInr
+  );
   return {
-    taskRewardInr,
-    taskRewardUsd: Number((taskRewardInr / 75).toFixed(2)),
+    standardTaskInr,
+    standardTaskUsd: Number((standardTaskInr / 75).toFixed(2)),
+    twoFactorTaskInr,
+    twoFactorTaskUsd: Number((twoFactorTaskInr / 75).toFixed(2)),
+    taskRewardInr: standardTaskInr,
+    taskRewardUsd: Number((standardTaskInr / 75).toFixed(2)),
     minWithdrawalInr: Number(stored.minWithdrawalInr ?? DEFAULT_RATES.minWithdrawalInr),
     referralBonusInr: Number(stored.referralBonusInr ?? DEFAULT_RATES.referralBonusInr),
     dailyStreakBaseInr: Number(stored.dailyStreakBaseInr ?? DEFAULT_RATES.dailyStreakBaseInr),
@@ -115,6 +130,22 @@ async function registerUserInIndex(kv, userId) {
   }
 }
 
+async function getAdminTasks(kv) {
+  return await getKvJson(kv, "config:admin_tasks", []);
+}
+
+async function saveAdminTasks(kv, tasks) {
+  return await putKvJson(kv, "config:admin_tasks", tasks);
+}
+
+async function getTaskReviewQueue(kv) {
+  return await getKvJson(kv, "config:task_review_queue", []);
+}
+
+async function saveTaskReviewQueue(kv, queue) {
+  return await putKvJson(kv, "config:task_review_queue", queue);
+}
+
 async function getPayoutQueue(kv) {
   return await getKvJson(kv, "config:payout_queue", []);
 }
@@ -147,11 +178,13 @@ function createDefaultUser(userId, firstName = "User", username = "") {
     isBanned: false,
     state: "IDLE",
     // Possible states:
-    // User: "IDLE" | "AWAITING_UPI"
-    // Admin: "AWAITING_RATE_TASK" | "AWAITING_RATE_MIN_WITHDRAW" | "AWAITING_RATE_REFERRAL"
+    // User:  "IDLE" | "AWAITING_UPI" | "AWAITING_2FA_CODES" | "AWAITING_USER_SUBMIT_GMAIL"
+    // Admin: "AWAITING_RATE_TASK" | "AWAITING_RATE_2FA_TASK" | "AWAITING_RATE_MIN_WITHDRAW" | "AWAITING_RATE_REFERRAL"
     //        "AWAITING_FORCE_CHANNEL" | "AWAITING_ADMIN_ID" | "AWAITING_BROADCAST"
-    //        "AWAITING_INSPECT_USER_ID" | "AWAITING_USER_ADD_BAL" | "AWAITING_USER_DEDUCT_BAL"
-    //        "AWAITING_REJECT_REASON"
+    //        "AWAITING_INSPECT_USER_ID" | "AWAITING_HISTORY_USER_ID"
+    //        "AWAITING_USER_ADD_BAL" | "AWAITING_USER_DEDUCT_BAL"
+    //        "AWAITING_REJECT_REASON" | "AWAITING_TASK_REJECT_REASON"
+    //        "AWAITING_NEWTASK_EMAIL" | "AWAITING_NEWTASK_PASSWORD" | "AWAITING_NEWTASK_REWARD" | "AWAITING_NEWTASK_SLOTS"
     adminContext: {},
     balanceInr: 0,
     lifetimeInr: 0,
@@ -164,6 +197,7 @@ function createDefaultUser(userId, firstName = "User", username = "") {
     currentTask: null,
     referrals: {
       referredBy: null,
+      referralBonusPaid: false,
       invitedUsers: [],
       invitedCount: 0,
       totalCommissionInr: 0,
@@ -201,7 +235,11 @@ async function getUserData(kv, userId, firstName = "User", username = "") {
       ...defaults,
       ...parsed,
       adminContext: parsed.adminContext || {},
-      accounts: { ...defaults.accounts, ...(parsed.accounts || {}) },
+      accounts: {
+        ...defaults.accounts,
+        ...(parsed.accounts || {}),
+        history: Array.isArray(parsed.accounts?.history) ? parsed.accounts.history : [],
+      },
       referrals: { ...defaults.referrals, ...(parsed.referrals || {}) },
       rewards: { ...defaults.rewards, ...(parsed.rewards || {}) },
       settings: { ...defaults.settings, ...(parsed.settings || {}) },
@@ -224,7 +262,7 @@ async function saveUserData(kv, user) {
 }
 
 // ============================================================================
-// 3. REALISTIC TASK & FORMATTING GENERATORS
+// 3. TASK & FORMATTING GENERATORS (ADMIN CUSTOM TASKS + FALLBACK GENERATOR)
 // ============================================================================
 function randomItem(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
@@ -243,15 +281,61 @@ function generatePassword() {
   return `${pick(upper)}${pick(lower)}${pick(digits)}${pick(symbols)}${pick(lower)}${pick(upper)}${pick(symbols)}${pick(digits)}${pick(digits)}`;
 }
 
-function generateNewTask() {
+function resolveEmailPattern(pattern) {
+  let cleaned = String(pattern || "").trim();
+  if (!cleaned.includes("@")) {
+    cleaned = `${cleaned}@gmail.com`;
+  }
+  // Replace any '#' or '*' placeholders with random digits
+  if (cleaned.includes("#") || cleaned.includes("*")) {
+    cleaned = cleaned.replace(/[#*]/g, () => String(randomInt(0, 9)));
+  }
+  return cleaned.toLowerCase();
+}
+
+function buildTaskFromAdminSpec(adminTask) {
+  const firstName = randomItem(FIRST_NAMES);
+  const lastName = randomItem(LAST_NAMES);
+  const resolvedEmail = resolveEmailPattern(adminTask.emailPattern);
+  const rewardInr = Number(adminTask.rewardInr || DEFAULT_RATES.standardTaskInr);
+
+  return {
+    taskId: `TSK-${randomInt(100000, 999999)}`,
+    customTaskId: adminTask.customTaskId,
+    isCustomAdminTask: true,
+    taskType: adminTask.taskType === "2-Step Gmail" ? "2-Step Gmail" : "Normal Gmail",
+    rewardInr,
+    rewardUsd: Number((rewardInr / 75).toFixed(2)),
+    firstName,
+    lastName,
+    emailPattern: adminTask.emailPattern,
+    email: resolvedEmail,
+    password: adminTask.password,
+    birthYear: randomInt(1988, 2003),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function generateNewTask(taskType = "Normal Gmail", rates = DEFAULT_RATES) {
   const firstName = randomItem(FIRST_NAMES);
   const lastName = randomItem(LAST_NAMES);
   const digits = randomInt(1000, 9999);
   const emailPrefix = `${firstName.toLowerCase()}.${lastName.toLowerCase()}${digits}`;
+  const isTwoFactor = taskType === "2-Step Gmail";
+  const rewardInr = isTwoFactor
+    ? Number(rates.twoFactorTaskInr ?? DEFAULT_RATES.twoFactorTaskInr)
+    : Number(rates.standardTaskInr ?? rates.taskRewardInr ?? DEFAULT_RATES.standardTaskInr);
+
   return {
     taskId: `TSK-${randomInt(100000, 999999)}`,
+    customTaskId: null,
+    isCustomAdminTask: false,
+    taskType: isTwoFactor ? "2-Step Gmail" : "Normal Gmail",
+    rewardInr,
+    rewardUsd: Number((rewardInr / 75).toFixed(2)),
     firstName,
     lastName,
+    emailPattern: `${emailPrefix}@gmail.com`,
     email: `${emailPrefix}@gmail.com`,
     password: generatePassword(),
     birthYear: randomInt(1988, 2003),
@@ -279,6 +363,10 @@ function getReferralTier(invitedCount, baseRateInr = DEFAULT_RATES.referralBonus
 
 function isValidUpi(upi) {
   return /^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$/.test(upi);
+}
+
+function isValidGmailAddress(email) {
+  return /^[a-zA-Z0-9._%+-]+@gmail\.com$/i.test(String(email || "").trim());
 }
 
 function escapeMd(text = "") {
@@ -341,7 +429,7 @@ function buildForceJoinScreen(missingChannels) {
   const text =
     `🔒 *Mandatory Channel Verification*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `To use this bot and earn instant UPI rewards, you must join our official channel(s) below:\n\n` +
+    `To use this bot and earn UPI rewards, you must join our official channel(s) below:\n\n` +
     `${channelListText}\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `👇 _Join all channels above, then tap_ *🔄 Check / Verified* _to unlock the dashboard:_`;
@@ -352,8 +440,8 @@ function buildForceJoinScreen(missingChannels) {
 // ============================================================================
 // 5. USER INLINE KEYBOARDS (100% Pure InlineKeyboardMarkup)
 // ============================================================================
-function buildMainMenuKeyboard() {
-  return new InlineKeyboard()
+function buildMainMenuKeyboard(isAdmin = false) {
+  const kb = new InlineKeyboard()
     .text("📩 Register an Account", "menu_register")
     .text("📑 My Accounts", "menu_accounts")
     .row()
@@ -364,21 +452,59 @@ function buildMainMenuKeyboard() {
     .row()
     .text("⚙️ Settings", "menu_settings")
     .text("❓ Help", "menu_help");
+
+  if (isAdmin) {
+    kb.row().text("🛡️ Admin Panel", "admin_home");
+  }
+
+  return kb;
 }
 
-function buildTaskKeyboard() {
+function buildTaskTypeSelectorKeyboard(rates, adminTasks = []) {
+  const kb = new InlineKeyboard();
+  const availableAdminTasks = adminTasks.filter((t) => Number(t.remainingSlots || 0) > 0);
+
+  availableAdminTasks.slice(0, 6).forEach((t, idx) => {
+    const icon = t.taskType === "2-Step Gmail" ? "🔐" : "📧";
+    kb.text(
+      `${icon} Task #${idx + 1}: ${t.emailPattern} (₹${t.rewardInr} • ${t.remainingSlots} left)`,
+      `claim_admin_task_${t.customTaskId}`
+    ).row();
+  });
+
+  kb.text(`📧 Auto Standard Gmail (₹${rates.standardTaskInr})`, "register_type_standard")
+    .row()
+    .text(`🔐 Auto 2-Step (2FA) Gmail (₹${rates.twoFactorTaskInr})`, "register_type_2fa")
+    .row()
+    .text("🔙 Back to Main Menu", "menu_home");
+  return kb;
+}
+
+function buildTaskKeyboard(task) {
+  const is2FA = task?.taskType === "2-Step Gmail";
   return new InlineKeyboard()
-    .text("✅ Done", "task_done")
+    .text(is2FA ? "✅ Done (Submit Gmail + 2FA)" : "✅ Done (Submit Gmail)", "task_done")
     .text("🚫 Cancel", "task_cancel")
     .row()
-    .text("❓ How to create account?", "task_guide")
+    .text("🔄 Change Task", "task_change_type")
+    .text("❓ How to create?", "task_guide")
     .row()
     .text("🔙 Back to Main Menu", "menu_home");
 }
 
+function buildAwaitingUserSubmitGmailKeyboard(task) {
+  const kb = new InlineKeyboard();
+  if (task && task.taskType !== "2-Step Gmail" && task.email && !String(task.email).includes("#")) {
+    kb.text(`⚡ Quick Submit: ${task.email}`, "task_quick_submit_assigned").row();
+  }
+  kb.text("🔙 Back to Task Credentials", "task_resume")
+    .text("🚫 Cancel Task", "task_cancel");
+  return kb;
+}
+
 function buildTaskGuideKeyboard() {
   return new InlineKeyboard()
-    .text("🔙 Back to Task", "menu_register")
+    .text("🔙 Back to Task", "task_resume")
     .row()
     .text("🏠 Main Menu", "menu_home");
 }
@@ -417,7 +543,7 @@ function buildCancelUpiKeyboard() {
 function buildReferralsKeyboard(botUsername, userId, rates) {
   const inviteLink = `https://t.me/${botUsername}?start=ref_${userId}`;
   const shareText = encodeURIComponent(
-    `🔥 Earn ₹${rates.taskRewardInr} ($${rates.taskRewardUsd.toFixed(2)}) per registered account with instant UPI payouts! Join using my invite link:`
+    `🔥 Earn ₹${rates.standardTaskInr}–₹${rates.twoFactorTaskInr} per registered Gmail account with fast UPI payouts! Join using my invite link:`
   );
   const tgShareUrl = `https://t.me/share/url?url=${encodeURIComponent(inviteLink)}&text=${shareText}`;
 
@@ -519,17 +645,26 @@ function buildFaqBackKeyboard() {
 // ============================================================================
 function buildAdminDashboardKeyboard() {
   return new InlineKeyboard()
+    .text("➕ Create / Add New Task", "admin_task_add")
+    .text("📋 Manage Custom Tasks", "admin_tasks_manage")
+    .row()
+    .text("📝 Review Pending Tasks", "admin_tasks_queue")
+    .text("📑 Task Submissions History", "admin_task_history")
+    .row()
+    .text("👥 View All Users", "admin_users_list")
+    .text("🔍 Inspect User", "admin_inspect")
+    .row()
     .text("📊 Real-Time Analytics", "admin_analytics")
     .text("💳 Manage Payouts", "admin_payouts")
     .row()
     .text("🎁 Set Reward Rates", "admin_rates")
     .text("📢 Force Channels", "admin_channels")
     .row()
-    .text("👥 Manage Admins", "admin_admins")
+    .text("🛡️ Manage Admins", "admin_admins")
     .text("📣 Broadcast Message", "admin_broadcast")
     .row()
-    .text("🔍 Inspect User", "admin_inspect")
     .text("⚙️ Maintenance Mode", "admin_maintenance")
+    .text("⚠️ Wipe / Reset All Platform Data", "admin_system_reset")
     .row()
     .text("🔙 Close Admin Panel", "admin_close");
 }
@@ -542,9 +677,29 @@ function buildAdminCancelInputKeyboard(backCallback = "admin_home") {
   return new InlineKeyboard().text("🚫 Cancel Admin Input", backCallback);
 }
 
+function buildAdminCreateTaskTypeKeyboard() {
+  return new InlineKeyboard()
+    .text("📧 Standard Gmail (Without 2FA)", "admin_newtask_type_standard")
+    .row()
+    .text("🔐 2-Step Verification Gmail (2FA)", "admin_newtask_type_2fa")
+    .row()
+    .text("📋 View Active Admin Tasks", "admin_tasks_manage")
+    .row()
+    .text("🔙 Back to Admin Panel", "admin_home");
+}
+
+function buildAdminSkipRewardKeyboard(defaultRateInr) {
+  return new InlineKeyboard()
+    .text(`⚡ Use Default Rate (₹${defaultRateInr})`, "admin_newtask_skip_reward")
+    .row()
+    .text("🚫 Cancel Task Creation", "admin_home");
+}
+
 function buildAdminRatesKeyboard(rates) {
   return new InlineKeyboard()
-    .text(`💰 Task Reward (₹${rates.taskRewardInr})`, "admin_rate_task")
+    .text(`📧 Standard Gmail Rate (₹${rates.standardTaskInr})`, "admin_rate_task")
+    .row()
+    .text(`🔐 2-Step (2FA) Gmail Rate (₹${rates.twoFactorTaskInr})`, "admin_rate_2fa_task")
     .row()
     .text(`🎯 Min Withdrawal (₹${rates.minWithdrawalInr})`, "admin_rate_min_withdraw")
     .row()
@@ -599,10 +754,12 @@ function buildAdminInspectUserKeyboard(targetUser) {
     .text("➕ Add Balance", `admin_user_addbal_${targetUser.userId}`)
     .text("➖ Deduct Balance", `admin_user_deductbal_${targetUser.userId}`)
     .row()
+    .text("📑 User Task & Payout History", `admin_user_history_${targetUser.userId}`)
+    .row()
     .text(banLabel, `admin_user_toggleban_${targetUser.userId}`)
     .text("🔄 Refresh Profile", `admin_user_view_${targetUser.userId}`)
     .row()
-    .text("🔍 Search Another User", "admin_inspect")
+    .text("👥 All Users List", "admin_users_list")
     .text("🔙 Admin Panel", "admin_home");
 }
 
@@ -616,6 +773,13 @@ function buildAdminMaintenanceKeyboard(maint) {
     .text("🔙 Back to Admin Panel", "admin_home");
 }
 
+function buildAdminSystemResetConfirmKeyboard() {
+  return new InlineKeyboard()
+    .text("🚨 YES, WIPE & RESET ALL DATA TO 0", "admin_system_reset_confirm")
+    .row()
+    .text("🔙 No, Cancel & Return to Admin Panel", "admin_home");
+}
+
 // ============================================================================
 // 7. SCREEN TEXT RENDERERS (User & Admin Screens)
 // ============================================================================
@@ -625,26 +789,102 @@ function renderHomeText(user) {
     `💼 *Account Overview*\n` +
     `├ 👛 *Available Balance:* \`${formatMoney(user.balanceInr, user.settings.currency)}\`\n` +
     `├ ✅ *Verified Accounts:* \`${user.accounts.approved}\`\n` +
+    `├ ⏳ *Pending Review:* \`${user.accounts.pending}\`\n` +
     `└ 🔥 *Daily Streak:* \`${user.rewards.streakDays} Days\`\n\n` +
     `👇 *Choose an option from the menu below:*`
   );
 }
 
-function renderRegisterTaskText(task, rates) {
+function renderTaskTypeSelectText(rates, adminTasks = []) {
+  const availableAdminTasks = adminTasks.filter((t) => Number(t.remainingSlots || 0) > 0);
+  const customTaskSection =
+    availableAdminTasks.length > 0
+      ? `🎯 *Active Admin-Assigned Tasks (${availableAdminTasks.length} Available):*\n` +
+        availableAdminTasks
+          .slice(0, 6)
+          .map(
+            (t, i) =>
+              `${i + 1}. *${t.taskType}* — \`${t.emailPattern}\`\n` +
+              `   ├ 🔑 *Password:* \`${t.password}\`\n` +
+              `   └ 💰 *Reward:* *₹${Number(t.rewardInr).toFixed(2)}* • 🎯 *Slots Left:* \`${t.remainingSlots}/${t.totalSlots}\``
+          )
+          .join("\n\n") +
+        `\n\n━━━━━━━━━━━━━━━━━━━━━━\n`
+      : "";
+
   return (
-    `📩 *Register a New Gmail Account*\n` +
+    `📩 *Register an Account — Available Tasks*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `🆔 *Task ID:* \`${task.taskId}\`\n` +
-    `💰 *Payout:* *₹${rates.taskRewardInr.toFixed(2)}* (\`$${rates.taskRewardUsd.toFixed(2)}\`)\n\n` +
-    `📋 *Use these exact credentials:*\n` +
+    customTaskSection +
+    `📋 *Task Categories:*\n` +
+    `• *📧 Standard Gmail (No 2FA):* *₹${rates.standardTaskInr.toFixed(2)}*\n` +
+    `• *🔐 2-Step Verification Gmail (2FA):* *₹${rates.twoFactorTaskInr.toFixed(2)}*\n\n` +
+    `⚠️ *Rule:* Logout from your phone immediately after creating, otherwise admin cannot login and task will be *REJECTED*.\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 _Select an Admin Task or Task Category below to start:_`
+  );
+}
+
+function renderRegisterTaskText(task) {
+  const is2FA = task.taskType === "2-Step Gmail";
+  const patternNote =
+    task.emailPattern && task.emailPattern !== task.email
+      ? `• *Admin Pattern:* \`${task.emailPattern}\`\n`
+      : "";
+  const twoFactorInstruction = is2FA
+    ? `\n🔐 *2-STEP (2FA) REQUIREMENT:*\n` +
+      `Enable 2-Step Verification on this Gmail account and generate *Backup Codes* or an *App Password*. When you tap *✅ Done*, you will submit the exact Gmail created along with your 2FA Backup Codes / App Password.\n`
+    : "";
+
+  return (
+    `📩 *Register Gmail Account Task*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `🆔 *Task ID:* \`${task.taskId}\`${task.customTaskId ? ` (\`${task.customTaskId}\`)` : ""}\n` +
+    `🏷️ *Task Type:* *${task.taskType}*\n` +
+    `💰 *Payout (On Admin Approval):* *₹${Number(task.rewardInr).toFixed(2)}* (\`$${Number(task.rewardUsd).toFixed(2)}\`)\n\n` +
+    `📋 *Use these exact Admin-specified credentials:*\n` +
     `• *First Name:* \`${task.firstName}\`\n` +
     `• *Last Name:* \`${task.lastName}\`\n` +
-    `• *Target Email:* \`${task.email}\`\n` +
-    `• *Suggested Password:* \`${task.password}\`\n` +
-    `• *Year of Birth:* \`${task.birthYear}\`\n\n` +
-    `⚠️ *Be sure to use the specified data, otherwise the account will not be paid.*\n` +
+    patternNote +
+    `• *Target Gmail:* \`${task.email}\`\n` +
+    `• *Exact Password:* \`${task.password}\`\n` +
+    `• *Year of Birth:* \`${task.birthYear}\`\n` +
+    `${twoFactorInstruction}\n` +
+    `⚠️ *Rule: Logout from your phone immediately after creating, otherwise admin cannot login and task will be REJECTED.*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `💡 _Tap any credential above to copy it to your clipboard, create the account, then press_ *✅ Done* _below._`
+    `💡 _Tap any credential above to copy it, create the account, log out from your device, then press_ *✅ Done* _below._`
+  );
+}
+
+function renderAwaitingUserSubmitGmailText(task) {
+  const is2FA = task.taskType === "2-Step Gmail";
+  if (is2FA) {
+    return (
+      `🔐 *Submit Created 2FA Gmail & Backup Codes / App Password*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🆔 *Task ID:* \`${task.taskId}\`\n` +
+      `🎯 *Assigned Email / Pattern:* \`${task.emailPattern || task.email}\`\n` +
+      `🔑 *Assigned Password:* \`${task.password}\`\n` +
+      `💰 *Reward:* *₹${Number(task.rewardInr).toFixed(2)}*\n\n` +
+      `📝 *Please send the exact Gmail address you created AND your 2FA Backup Codes / App Password in a single message:*\n\n` +
+      `*Accepted Format Example:*\n` +
+      `\`${task.email} 49201842, 83910492\`\n` +
+      `or\n` +
+      `\`${task.email} abcd efgh ijkl mnop\`\n\n` +
+      `⚠️ *Rule: Logout from your phone immediately after creating, otherwise admin cannot login and task will be REJECTED.*`
+    );
+  }
+
+  return (
+    `📧 *Confirm & Submit Created Gmail Address*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `🆔 *Task ID:* \`${task.taskId}\`\n` +
+    `🎯 *Assigned Target Email:* \`${task.email}\`\n` +
+    `🔑 *Assigned Password:* \`${task.password}\`\n` +
+    `💰 *Reward:* *₹${Number(task.rewardInr).toFixed(2)}*\n\n` +
+    `📝 *Please type and send the exact Gmail address you created in chat (or tap Quick Submit below):*\n` +
+    `*Example:* \`${task.email}\`\n\n` +
+    `⚠️ *Rule: Logout from your phone immediately after creating, otherwise admin cannot login and task will be REJECTED.*`
   );
 }
 
@@ -656,13 +896,15 @@ function renderTaskGuideText(task) {
     `Open a fresh incognito window in your browser or add a new Google account in device settings.\n\n` +
     `*2️⃣ Enter Assigned Profile Data*\n` +
     `• Name: \`${task.firstName} ${task.lastName}\`\n` +
-    `• Username: \`${task.email.split("@")[0]}\`\n` +
-    `• Password: \`${task.password}\`\n` +
+    `• Gmail: \`${task.email}\`\n` +
+    `• Exact Password: \`${task.password}\`\n` +
     `• Birth Year: \`${task.birthYear}\`\n\n` +
-    `*3️⃣ Complete Setup Without Recovery Email*\n` +
-    `Skip phone/recovery email if prompted, accept Google Terms, and wait for the inbox to load.\n\n` +
-    `*4️⃣ Sign Out & Submit*\n` +
-    `Remove the account from your device so it remains clean, then return here and press *✅ Done*!`
+    `*3️⃣ Task Type Instructions (${task.taskType})*\n` +
+    (task.taskType === "2-Step Gmail"
+      ? `Enable 2-Step Verification in Google Security settings, generate *Backup Codes* or an *App Password*, and copy them before signing out.\n\n`
+      : `Skip phone/recovery email if prompted, accept Google Terms, and wait for the inbox to load. Do NOT enable 2FA on Standard tasks.\n\n`) +
+    `*4️⃣ Sign Out & Submit for Review*\n` +
+    `⚠️ *Rule:* Logout from your phone immediately after creating, otherwise admin cannot login and task will be *REJECTED*.`
   );
 }
 
@@ -671,11 +913,14 @@ function renderMyAccountsText(user) {
   const recentLines =
     user.accounts.history.length > 0
       ? user.accounts.history
-          .slice(0, 5)
-          .map(
-            (item, i) =>
-              `${i + 1}. \`${item.email}\` — *+₹${item.rewardInr}* (${item.date.slice(0, 10)})`
-          )
+          .slice(0, 6)
+          .map((item, i) => {
+            const status = item.status || "APPROVED";
+            const badge =
+              status === "APPROVED" ? "✅" : status === "REJECTED" ? "❌" : "⏳";
+            const typeTag = item.taskType === "2-Step Gmail" ? "🔐 2FA" : "📧 Std";
+            return `${i + 1}. ${badge} \`${item.email}\` (${typeTag}) — *₹${item.rewardInr}* [${status}]`;
+          })
           .join("\n")
       : "_No registered accounts yet. Tap 'Register an Account' on the main menu to start earning!_";
 
@@ -687,7 +932,7 @@ function renderMyAccountsText(user) {
     `├ ⏳ *Pending Verification:* \`${user.accounts.pending}\`\n` +
     `├ ❌ *Rejected:* \`${user.accounts.rejected}\`\n` +
     `└ 📦 *Total Submitted:* \`${total}\`\n\n` +
-    `🗂️ *Recent Approved Submissions:*\n` +
+    `🗂️ *Recent Account Submissions:*\n` +
     `${recentLines}\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `🕒 _Last synced: ${new Date().toISOString().slice(11, 19)} UTC_`
@@ -759,11 +1004,11 @@ function renderReferralsText(user, botUsername, rates) {
     `🔗 *Your Personal Invite Link:*\n` +
     `\`${inviteLink}\`\n\n` +
     `🏆 *Current Tier:* ${tier.name}\n` +
-    `💸 *Commission Rate:* *₹${tier.rateInr.toFixed(2)}* per active invite\n` +
+    `💸 *Commission Rate:* *₹${tier.rateInr.toFixed(2)}* per verified invite\n` +
     `👨‍👩‍👧‍👦 *Total Invited Users:* \`${user.referrals.invitedCount}\`\n` +
     `💰 *Total Referral Earnings:* \`₹${user.referrals.totalCommissionInr.toFixed(2)}\`\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `🚀 _Share your personal link with friends and earn instant rewards when they join!_`
+    `🚀 _Share your personal link with friends and earn rewards when they join and complete tasks!_`
   );
 }
 
@@ -857,11 +1102,12 @@ function renderHelpText() {
 function getFaqAnswers(rates) {
   return {
     faq_hold:
-      `🕒 *What is a hold?*\n` +
+      `🕒 *What is a verification review / hold?*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `A *hold* is a temporary verification window during which our automated system checks that a newly registered Gmail account remains active and hasn't been locked by Google's automated filters.\n\n` +
-      `• *Instant Tasks:* Credited immediately (*₹${rates.taskRewardInr.toFixed(2)}*) upon clicking *✅ Done* when using our exact profile parameters.\n` +
-      `• *Quality Checks:* Ensure you sign out of the Gmail account on your device after creation so no security prompts trigger during verification.`,
+      `When you submit a Gmail task (*✅ Done*), it enters our *PENDING* verification queue so an administrator can verify the credentials and confirm you logged out of the device.\n\n` +
+      `• *Standard Gmail Task:* Pays *₹${rates.standardTaskInr.toFixed(2)}* upon Admin approval.\n` +
+      `• *2-Step Verification (2FA) Task:* Pays *₹${rates.twoFactorTaskInr.toFixed(2)}* upon Admin verification of your Backup Codes / App Password.\n` +
+      `• *Mandatory Logout:* Always sign out of the Gmail account on your device immediately after creation.`,
 
     faq_sms:
       `💬 *How to avoid SMS confirmation?*\n` +
@@ -872,13 +1118,13 @@ function getFaqAnswers(rates) {
       `3️⃣ *Clear Browser Data:* Always use a clean Incognito tab and wait at least 15–30 minutes between consecutive registrations.`,
 
     faq_unavailable:
-      `🔴 *Why is my account unavailable?*\n` +
+      `🔴 *Why was my account rejected?*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `An account may be marked unavailable or rejected if:\n\n` +
-      `• The *First Name, Last Name, or Email handle* did not match the assigned task credentials.\n` +
-      `• The password was changed after submission or 2-Step Verification (2FA) was left enabled.\n` +
-      `• A recovery email or phone number remained linked to the account.\n\n` +
-      `⚠️ _Always copy-paste the exact credentials generated on the task screen._`,
+      `An account submission will be marked *REJECTED* if:\n\n` +
+      `• You remained logged in on your device (triggering device prompts during admin login).\n` +
+      `• The *Gmail address or Password* did not match the assigned task credentials.\n` +
+      `• For 2-Step Verification tasks, valid Backup Codes or App Passwords were not provided.\n\n` +
+      `⚠️ _Always copy-paste the exact credentials generated on the task screen and log out immediately._`,
 
     faq_avoid_block:
       `🛡️ *How can I avoid blocking my Gmail?*\n` +
@@ -886,8 +1132,7 @@ function getFaqAnswers(rates) {
       `To maintain a 100% approval rate and prevent Google from disabling newly created accounts:\n\n` +
       `• Never register more than *2–3 accounts per IP address* per day.\n` +
       `• Switch from Wi-Fi to Mobile Data (4G/5G) and cycle Airplane Mode between tasks.\n` +
-      `• Type the credentials naturally or paste carefully without using automated browser extensions.\n` +
-      `• Log out of the account immediately after reaching the Gmail inbox.`,
+      `• Remove the Google account from your phone settings immediately after reaching the Gmail inbox.`,
 
     faq_limit:
       `🪪 *How many accounts can I register?*\n` +
@@ -914,8 +1159,14 @@ async function renderAdminDashboardText(kv, env, userId) {
   const rates = await getDynamicRates(kv);
   const maint = await getMaintenanceState(kv);
   const channels = await getForceChannels(kv);
-  const queue = await getPayoutQueue(kv);
-  const pendingPayouts = queue.filter((p) => p.status === "PROCESSING");
+  const payoutQueue = await getPayoutQueue(kv);
+  const taskQueue = await getTaskReviewQueue(kv);
+  const adminTasks = await getAdminTasks(kv);
+  const usersIndex = await getUsersIndex(kv);
+
+  const pendingPayouts = payoutQueue.filter((p) => p.status === "PROCESSING");
+  const pendingTasks = taskQueue.filter((t) => t.status === "PENDING");
+  const activeAdminTasks = adminTasks.filter((t) => Number(t.remainingSlots || 0) > 0);
   const isSuper = isSuperAdminId(env, userId);
 
   return (
@@ -923,10 +1174,14 @@ async function renderAdminDashboardText(kv, env, userId) {
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `👤 *Admin Role:* \`${isSuper ? "SUPER ADMIN" : "SECONDARY ADMIN"}\`\n` +
     `⚙️ *Maintenance Mode:* ${maint.enabled ? "🔴 *ENABLED (Users Blocked)*" : "🟢 *DISABLED (Live)*"}\n` +
-    `📢 *Force-Join Channels:* \`${channels.length} Active\`\n` +
-    `💳 *Pending UPI Payouts:* \`${pendingPayouts.length} Request(s)\`\n\n` +
+    `👥 *Total Registered Users:* \`${usersIndex.length}\`\n` +
+    `🎯 *Active Admin Tasks:* \`${activeAdminTasks.length} Task(s)\`\n` +
+    `📝 *Pending Task Reviews:* \`${pendingTasks.length} Submission(s)\`\n` +
+    `💳 *Pending UPI Payouts:* \`${pendingPayouts.length} Request(s)\`\n` +
+    `📢 *Force-Join Channels:* \`${channels.length} Active\`\n\n` +
     `📊 *Live Dynamic Rates:*\n` +
-    `├ 💰 *Task Reward:* \`₹${rates.taskRewardInr.toFixed(2)}\`\n` +
+    `├ 📧 *Standard Gmail:* \`₹${rates.standardTaskInr.toFixed(2)}\`\n` +
+    `├ 🔐 *2-Step (2FA) Gmail:* \`₹${rates.twoFactorTaskInr.toFixed(2)}\`\n` +
     `├ 🎯 *Min Withdrawal:* \`₹${rates.minWithdrawalInr.toFixed(2)}\`\n` +
     `└ 👥 *Referral Bonus:* \`₹${rates.referralBonusInr.toFixed(2)}\`\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -934,12 +1189,181 @@ async function renderAdminDashboardText(kv, env, userId) {
   );
 }
 
+function renderAdminManageCustomTasksView(adminTasks) {
+  const kb = new InlineKeyboard().text("➕ Create / Add New Task", "admin_task_add").row();
+
+  if (!adminTasks || adminTasks.length === 0) {
+    const text =
+      `📋 *Manage Admin-Created Tasks (config:admin_tasks)*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `_No custom tasks created yet. Click "➕ Create / Add New Task" below to publish specific Gmail names/patterns, passwords, rewards, and slot limits for users!_\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━`;
+    kb.text("🔙 Back to Admin Panel", "admin_home");
+    return { text, replyMarkup: kb };
+  }
+
+  const lines = adminTasks
+    .slice(0, 8)
+    .map((t, i) => {
+      const statusBadge = Number(t.remainingSlots) > 0 ? "🟢 ACTIVE" : "🔴 FULL";
+      return (
+        `*#${i + 1} • ${t.customTaskId}* [${statusBadge}]\n` +
+        `├ 🏷️ *Type:* *${t.taskType}*\n` +
+        `├ 📧 *Target Email/Pattern:* \`${t.emailPattern}\`\n` +
+        `├ 🔑 *Required Password:* \`${t.password}\`\n` +
+        `├ 💰 *Reward:* *₹${Number(t.rewardInr).toFixed(2)}*\n` +
+        `└ 🎯 *Slots:* \`${t.remainingSlots} remaining / ${t.totalSlots} total\``
+      );
+    })
+    .join("\n\n");
+
+  adminTasks.slice(0, 6).forEach((t) => {
+    kb.text(
+      `🗑️ Delete ${t.customTaskId} (${t.emailPattern})`,
+      `admin_custom_task_del_${t.customTaskId}`
+    ).row();
+  });
+
+  kb.text("🔄 Refresh Tasks", "admin_tasks_manage")
+    .text("🔙 Admin Panel", "admin_home");
+
+  const text =
+    `📋 *Manage Custom Admin Tasks (${adminTasks.length})*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `${lines}\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 _Add a new task or delete an existing task below:_`;
+
+  return { text, replyMarkup: kb };
+}
+
+async function renderAdminUsersListPaginatedView(kv, page = 0) {
+  const pageSize = 10;
+  const userIds = await getUsersIndex(kv);
+  const totalUsers = userIds.length;
+  const totalPages = Math.max(1, Math.ceil(totalUsers / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const sliceIds = userIds.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const usersData = [];
+  for (const uid of sliceIds) {
+    const u = await getUserData(kv, uid);
+    usersData.push(u);
+  }
+
+  const listLines =
+    usersData.length > 0
+      ? usersData
+          .map((u, idx) => {
+            const rank = safePage * pageSize + idx + 1;
+            const handle = u.username ? `@${escapeMd(u.username)}` : "_no username_";
+            const banTag = u.isBanned ? " 🚫[BANNED]" : "";
+            return (
+              `*${rank}. ${escapeMd(u.firstName)}* (${handle})${banTag}\n` +
+              `   └ 🆔 \`${u.userId}\` • 👛 *₹${Number(u.balanceInr).toFixed(2)}* • ✅ \`${u.accounts?.approved || 0}\` tasks`
+            );
+          })
+          .join("\n\n")
+      : "_No registered users found in config:users_index._";
+
+  const kb = new InlineKeyboard();
+  usersData.forEach((u) => {
+    kb.text(
+      `👤 ${u.firstName} (#${u.userId}) • ₹${Number(u.balanceInr).toFixed(0)} • ✅${u.accounts?.approved || 0}`,
+      `admin_user_view_${u.userId}`
+    ).row();
+  });
+
+  if (totalPages > 1) {
+    if (safePage > 0) {
+      kb.text("⬅️ Prev Page", `admin_users_page_${safePage - 1}`);
+    }
+    kb.text(`📄 ${safePage + 1}/${totalPages}`, "admin_users_list");
+    if (safePage < totalPages - 1) {
+      kb.text("Next Page ➡️", `admin_users_page_${safePage + 1}`);
+    }
+    kb.row();
+  }
+
+  kb.text("🔍 Search by User ID", "admin_inspect")
+    .text("🔙 Admin Panel", "admin_home");
+
+  const text =
+    `👥 *All Registered Users (${totalUsers} Total)*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `📄 *Page ${safePage + 1} of ${totalPages}*\n\n` +
+    `${listLines}\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 _Tap any user button below to open their full Inspector & History:_`;
+
+  return { text, replyMarkup: kb };
+}
+
+function renderAdminTaskQueueView(taskQueue) {
+  const pending = taskQueue.filter((t) => t.status === "PENDING");
+  const kb = new InlineKeyboard();
+
+  if (pending.length === 0) {
+    const text =
+      `📝 *Manual Task Verification Queue (config:task_review_queue)*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ *All caught up!* There are currently \`0\` pending Gmail tasks waiting for verification.\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━`;
+    kb.text("📑 View Submissions History", "admin_task_history")
+      .text("🔄 Refresh Queue", "admin_tasks_queue")
+      .row()
+      .text("🔙 Back to Admin Panel", "admin_home");
+    return { text, replyMarkup: kb };
+  }
+
+  const itemsText = pending
+    .slice(0, 5)
+    .map((t, idx) => {
+      const codeLine = t.twoFactorData
+        ? `├ 🔐 *2FA Codes / App Pass:* \`${escapeMd(t.twoFactorData)}\`\n`
+        : "";
+      return (
+        `*#${idx + 1} • ${t.taskId} (${t.taskType})*\n` +
+        `├ 👤 *User:* ${escapeMd(t.firstName || "User")} ${t.username ? `(@${escapeMd(t.username)})` : ""} [\`${t.userId}\`]\n` +
+        `├ 📧 *Submitted Gmail:* \`${t.email}\`\n` +
+        `├ 🔑 *Password:* \`${t.password}\`\n` +
+        codeLine +
+        `├ 💰 *Reward:* *₹${Number(t.rewardInr).toFixed(2)}*\n` +
+        `└ 🕒 *Submitted:* \`${String(t.submittedAt || "").slice(0, 19).replace("T", " ")}\``
+      );
+    })
+    .join("\n\n");
+
+  pending.slice(0, 5).forEach((t) => {
+    kb.text(`✅ Approve & Pay (${t.taskId})`, `admin_task_approve_${t.taskId}`)
+      .text(`❌ Reject Task`, `admin_task_reject_${t.taskId}`)
+      .row();
+  });
+
+  kb.text("📑 Submissions History", "admin_task_history")
+    .text("🔄 Refresh Queue", "admin_tasks_queue")
+    .row()
+    .text("🔙 Back to Admin Panel", "admin_home");
+
+  const text =
+    `📝 *Pending Task Verification Queue (${pending.length})*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `${itemsText}\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 _Verify login credentials & confirm user logged out, then Approve or Reject below:_`;
+
+  return { text, replyMarkup: kb };
+}
+
 async function computePlatformAnalytics(kv) {
   const userIds = await getUsersIndex(kv);
-  const queue = await getPayoutQueue(kv);
+  const payoutQueue = await getPayoutQueue(kv);
+  const taskQueue = await getTaskReviewQueue(kv);
 
   let totalSubmitted = 0;
   let totalApproved = 0;
+  let totalPending = 0;
+  let totalRejected = 0;
   let totalWalletBalanceInr = 0;
   let bannedUsersCount = 0;
 
@@ -952,6 +1376,8 @@ async function computePlatformAnalytics(kv) {
       const pending = Number(u.accounts?.pending || 0);
       const rejected = Number(u.accounts?.rejected || 0);
       totalApproved += approved;
+      totalPending += pending;
+      totalRejected += rejected;
       totalSubmitted += approved + pending + rejected;
       totalWalletBalanceInr += Number(u.balanceInr || 0);
       if (u.isBanned) bannedUsersCount += 1;
@@ -962,16 +1388,16 @@ async function computePlatformAnalytics(kv) {
 
   let totalPaidOutInr = 0;
   let totalPendingInr = 0;
-  let pendingCount = 0;
-  let completedCount = 0;
+  let pendingPayoutCount = 0;
+  let completedPayoutCount = 0;
 
-  for (const item of queue) {
+  for (const item of payoutQueue) {
     if (item.status === "COMPLETED") {
       totalPaidOutInr += Number(item.amountInr || 0);
-      completedCount += 1;
+      completedPayoutCount += 1;
     } else if (item.status === "PROCESSING") {
       totalPendingInr += Number(item.amountInr || 0);
-      pendingCount += 1;
+      pendingPayoutCount += 1;
     }
   }
 
@@ -980,11 +1406,14 @@ async function computePlatformAnalytics(kv) {
     bannedUsersCount,
     totalSubmitted,
     totalApproved,
+    totalPending,
+    totalRejected,
+    queueTotal: taskQueue.length,
     totalWalletBalanceInr,
     totalPaidOutInr,
     totalPendingInr,
-    pendingCount,
-    completedCount,
+    pendingCount: pendingPayoutCount,
+    completedCount: completedPayoutCount,
   };
 }
 
@@ -995,9 +1424,11 @@ function renderAdminAnalyticsText(stats) {
     `👥 *User Metrics:*\n` +
     `├ 🪪 *Total Registered Users:* \`${stats.totalUsers}\`\n` +
     `└ 🚫 *Banned Accounts:* \`${stats.bannedUsersCount}\`\n\n` +
-    `📑 *Task Submissions:*\n` +
-    `├ 📦 *Total Submitted:* \`${stats.totalSubmitted}\`\n` +
-    `└ ✅ *Total Approved:* \`${stats.totalApproved}\`\n\n` +
+    `📑 *Task Verification Ledger:*\n` +
+    `├ 📦 *Total Tasks Submitted:* \`${stats.totalSubmitted}\`\n` +
+    `├ ✅ *Total Approved:* \`${stats.totalApproved}\`\n` +
+    `├ ⏳ *Pending Verification:* \`${stats.totalPending}\`\n` +
+    `└ ❌ *Total Rejected:* \`${stats.totalRejected}\`\n\n` +
     `💰 *Financial Ledger (INR):*\n` +
     `├ 👛 *Active Wallet Liability:* \`₹${stats.totalWalletBalanceInr.toFixed(2)}\`\n` +
     `├ 💸 *Total Money Paid Out:* \`₹${stats.totalPaidOutInr.toFixed(2)}\` (\`${stats.completedCount}\` tx)\n` +
@@ -1005,6 +1436,134 @@ function renderAdminAnalyticsText(stats) {
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `🕒 _Live KV Snapshot: ${new Date().toISOString().slice(11, 19)} UTC_`
   );
+}
+
+async function renderAdminTaskSubmissionsHistoryView(kv) {
+  const stats = await computePlatformAnalytics(kv);
+  const taskQueue = await getTaskReviewQueue(kv);
+
+  const stdCount = taskQueue.filter((t) => t.taskType !== "2-Step Gmail").length;
+  const twoFaCount = taskQueue.filter((t) => t.taskType === "2-Step Gmail").length;
+  const totalTaskEarningsPaid = taskQueue
+    .filter((t) => t.status === "APPROVED")
+    .reduce((sum, t) => sum + Number(t.rewardInr || 0), 0);
+
+  const recentLines =
+    taskQueue.length > 0
+      ? taskQueue
+          .slice(0, 8)
+          .map((t, idx) => {
+            const badge =
+              t.status === "APPROVED" ? "✅" : t.status === "REJECTED" ? "❌" : "⏳";
+            const typeShort = t.taskType === "2-Step Gmail" ? "2FA" : "Std";
+            return (
+              `${idx + 1}. ${badge} \`${t.email}\` (${typeShort} • ₹${t.rewardInr})\n` +
+              `   └ 👤 User \`#${t.userId}\` • *${t.status}* • ${(t.submittedAt || "").slice(0, 10)}`
+            );
+          })
+          .join("\n")
+      : "_No task submissions recorded in config:task_review_queue yet._";
+
+  const text =
+    `📑 *Task Submissions History & Audit Log*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `📊 *Platform-Wide Task Totals:*\n` +
+    `├ 📦 *Total Submitted:* \`${stats.totalSubmitted}\` (\`Std: ${stdCount}\` | \`2FA: ${twoFaCount}\`)\n` +
+    `├ ✅ *Total Approved:* \`${stats.totalApproved}\`\n` +
+    `├ ⏳ *Currently Pending:* \`${stats.totalPending}\`\n` +
+    `├ ❌ *Total Rejected:* \`${stats.totalRejected}\`\n` +
+    `└ 💰 *Task Rewards Paid:* \`₹${totalTaskEarningsPaid.toFixed(2)}\`\n\n` +
+    `🗂️ *Recent Global Submissions:*\n` +
+    `${recentLines}\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 _Filter by User ID to inspect all Gmail IDs & payouts for a specific user:_`;
+
+  const kb = new InlineKeyboard()
+    .text("🔍 Filter / Search User by ID", "admin_history_search_user")
+    .text("👥 View All Users", "admin_users_list")
+    .row()
+    .text("📝 Pending Queue", "admin_tasks_queue")
+    .text("🔙 Admin Panel", "admin_home");
+
+  return { text, replyMarkup: kb };
+}
+
+function renderAdminUserTaskAndPayoutHistoryView(targetUser, taskQueue) {
+  const userTasksFromQueue = taskQueue.filter(
+    (t) => String(t.userId) === String(targetUser.userId)
+  );
+  const historyList =
+    targetUser.accounts?.history && targetUser.accounts.history.length > 0
+      ? targetUser.accounts.history
+      : userTasksFromQueue;
+
+  const totalTaskEarningsInr = historyList
+    .filter((h) => (h.status || "APPROVED") === "APPROVED")
+    .reduce((acc, h) => acc + Number(h.rewardInr || 0), 0);
+
+  const gmailLines =
+    historyList.length > 0
+      ? historyList
+          .slice(0, 10)
+          .map((h, i) => {
+            const st = h.status || "APPROVED";
+            const icon = st === "APPROVED" ? "✅" : st === "REJECTED" ? "❌" : "⏳";
+            const typeLabel = h.taskType === "2-Step Gmail" ? "🔐 2FA" : "📧 Std";
+            const reasonNote = h.rejectReason ? ` _(Reason: ${escapeMd(h.rejectReason)})_` : "";
+            return (
+              `${i + 1}. ${icon} \`${h.email}\` — *₹${Number(h.rewardInr || 0).toFixed(2)}* (${typeLabel})\n` +
+              `   └ 📅 \`${String(h.date || h.submittedAt || "").slice(0, 10)}\` • Status: *${st}*${reasonNote}`
+            );
+          })
+          .join("\n")
+      : "_No Gmail accounts submitted by this user yet._";
+
+  const withdrawals = targetUser.withdrawals || [];
+  const totalPaidUpi = withdrawals
+    .filter((w) => w.status === "COMPLETED")
+    .reduce((s, w) => s + Number(w.amountInr || 0), 0);
+  const totalPendingUpi = withdrawals
+    .filter((w) => w.status === "PROCESSING")
+    .reduce((s, w) => s + Number(w.amountInr || 0), 0);
+
+  const payoutLines =
+    withdrawals.length > 0
+      ? withdrawals
+          .slice(0, 5)
+          .map((w, i) => {
+            const icon =
+              w.status === "COMPLETED" ? "✅" : w.status === "REJECTED" ? "❌" : "⏳";
+            return `${i + 1}. ${icon} *₹${Number(w.amountInr).toFixed(2)}* → \`${w.upiId}\` [${w.status}] (${String(w.date || "").slice(0, 10)})`;
+          })
+          .join("\n")
+      : "_No UPI withdrawal requests from this user._";
+
+  const totalSubmitted =
+    Number(targetUser.accounts?.approved || 0) +
+    Number(targetUser.accounts?.pending || 0) +
+    Number(targetUser.accounts?.rejected || 0);
+
+  const text =
+    `📑 *User Task & Payout History Report*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👤 *User:* ${escapeMd(targetUser.firstName)} ${targetUser.username ? `(@${escapeMd(targetUser.username)})` : ""} [\`#${targetUser.userId}\`]\n` +
+    `├ 📦 *Total Tasks Submitted:* \`${totalSubmitted}\`\n` +
+    `├ ✅ *Approved:* \`${targetUser.accounts?.approved || 0}\` | ⏳ *Pending:* \`${targetUser.accounts?.pending || 0}\` | ❌ *Rejected:* \`${targetUser.accounts?.rejected || 0}\`\n` +
+    `└ 💰 *Total Earnings from Tasks:* \`₹${totalTaskEarningsInr.toFixed(2)}\`\n\n` +
+    `📧 *Submitted Gmail IDs (${historyList.length}):*\n` +
+    `${gmailLines}\n\n` +
+    `💳 *Payout History Summary (Paid: ₹${totalPaidUpi.toFixed(2)} | Pending: ₹${totalPendingUpi.toFixed(2)}):*\n` +
+    `${payoutLines}\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━`;
+
+  const kb = new InlineKeyboard()
+    .text("👤 Open User Inspector", `admin_user_view_${targetUser.userId}`)
+    .text("👥 All Users List", "admin_users_list")
+    .row()
+    .text("🔙 Submissions History", "admin_task_history")
+    .text("🛡️ Admin Panel", "admin_home");
+
+  return { text, replyMarkup: kb };
 }
 
 function renderAdminPayoutsView(queue) {
@@ -1060,12 +1619,13 @@ function renderAdminRatesText(rates) {
   return (
     `🎁 *Set Dynamic Reward Rates*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `Update platform payout rates and thresholds in real time without redeploying code:\n\n` +
-    `• 💰 *Task Reward:* \`₹${rates.taskRewardInr.toFixed(2)}\` (\`$${rates.taskRewardUsd.toFixed(2)}\`)\n` +
+    `Update platform payout rates for both task types and withdrawal thresholds in real time:\n\n` +
+    `• 📧 *Standard Gmail Task (No 2FA):* \`₹${rates.standardTaskInr.toFixed(2)}\` (\`$${rates.standardTaskUsd.toFixed(2)}\`)\n` +
+    `• 🔐 *2-Step Verification Gmail Task (With 2FA):* \`₹${rates.twoFactorTaskInr.toFixed(2)}\` (\`$${rates.twoFactorTaskUsd.toFixed(2)}\`)\n` +
     `• 🎯 *Min Withdrawal:* \`₹${rates.minWithdrawalInr.toFixed(2)}\`\n` +
     `• 👥 *Referral Base Bonus:* \`₹${rates.referralBonusInr.toFixed(2)}\`\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `👇 _Click any parameter below to enter a new value in chat:_`
+    `👇 _Click any rate below to enter a new INR value in chat:_`
   );
 }
 
@@ -1105,11 +1665,11 @@ function renderAdminManageAdminsText(env, subAdmins) {
       : "_No secondary admins added yet._";
 
   return (
-    `👥 *Manage Platform Administrators*\n` +
+    `🛡️ *Manage Platform Administrators*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `👑 *Super Admin (env.ADMIN_CHAT_ID):*\n` +
     `• \`${superId}\` _(Protected — Cannot be removed)_\n\n` +
-    `🛡️ *Secondary Admins (config:admins — ${subAdmins.length}):*\n` +
+    `👥 *Secondary Admins (config:admins — ${subAdmins.length}):*\n` +
     `${subList}\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `👇 _Add or revoke secondary admin privileges below:_`
@@ -1133,10 +1693,12 @@ function renderAdminInspectUserText(targetUser) {
     `├ 👛 *Available Balance:* \`₹${Number(targetUser.balanceInr).toFixed(2)}\`\n` +
     `├ 📈 *Lifetime Earnings:* \`₹${Number(targetUser.lifetimeInr).toFixed(2)}\`\n` +
     `├ ✅ *Approved Tasks:* \`${targetUser.accounts?.approved || 0}\`\n` +
+    `├ ⏳ *Pending Tasks:* \`${targetUser.accounts?.pending || 0}\`\n` +
+    `├ ❌ *Rejected Tasks:* \`${targetUser.accounts?.rejected || 0}\`\n` +
     `├ 👥 *Referrals Invited:* \`${targetUser.referrals?.invitedCount || 0}\`\n` +
     `└ 🏦 *Last UPI Used:* \`${escapeMd(lastUpi)}\`\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `👇 _Modify balance or ban status using the controls below:_`
+    `👇 _Modify balance, inspect submission history, or toggle ban below:_`
   );
 }
 
@@ -1150,6 +1712,25 @@ function renderAdminMaintenanceText(maint) {
     `• When *ENABLED*, all non-admin users receive a clean maintenance notice when clicking buttons or sending messages.\n` +
     `• Super Admins and Secondary Admins bypass maintenance mode completely for live testing.\n` +
     `━━━━━━━━━━━━━━━━━━━━━━`
+  );
+}
+
+function renderAdminSystemResetWarningText() {
+  return (
+    `⚠️ *FACTORY RESET / WIPE PLATFORM DATA*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `🚨 *CRITICAL WARNING — 2-STEP CONFIRMATION*\n\n` +
+    `Are you sure you want to reset all platform data to *0*?\n\n` +
+    `*This action will immediately:*\n` +
+    `• Reset all user wallet balances & lifetime earnings to \`₹0.00\`\n` +
+    `• Reset all user approved, pending, and rejected account counts to \`0\`\n` +
+    `• Clear all user referral trees and withdrawal histories\n` +
+    `• Clear \`config:task_review_queue\` to \`[]\`\n` +
+    `• Clear \`config:payout_queue\` to \`[]\`\n` +
+    `• Clear \`config:admin_tasks\` to \`[]\`\n\n` +
+    `✅ _Super Admin configuration, secondary admins, force-join channels, and reward rates will be preserved._\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 _Confirm below only if you want a 100% fresh clean slate:_`
   );
 }
 
@@ -1179,7 +1760,111 @@ async function editOrReply(ctx, text, replyMarkup) {
 }
 
 // ============================================================================
-// 10. BOT FACTORY, MIDDLEWARE & HANDLER REGISTRATION
+// 10. HELPER: SUBMIT TASK FOR MANUAL ADMIN VERIFICATION (NO AUTO-PAY)
+// ============================================================================
+async function submitTaskForManualVerification(
+  ctx,
+  kv,
+  env,
+  user,
+  task,
+  submittedEmail,
+  twoFactorData = null
+) {
+  const submittedAt = new Date().toISOString();
+  const rewardInr = Number(task.rewardInr || DEFAULT_RATES.standardTaskInr);
+  const taskType = task.taskType || "Normal Gmail";
+  const finalEmail = String(submittedEmail || task.email).trim().toLowerCase();
+
+  // If this task came from an Admin-created custom task, decrement remainingSlots
+  if (task.customTaskId) {
+    const adminTasks = await getAdminTasks(kv);
+    const targetAdminTask = adminTasks.find((t) => t.customTaskId === task.customTaskId);
+    if (targetAdminTask && Number(targetAdminTask.remainingSlots) > 0) {
+      targetAdminTask.remainingSlots = Math.max(0, Number(targetAdminTask.remainingSlots) - 1);
+      targetAdminTask.completedSlots = Number(targetAdminTask.completedSlots || 0) + 1;
+      await saveAdminTasks(kv, adminTasks);
+    }
+  }
+
+  const queueEntry = {
+    taskId: task.taskId,
+    customTaskId: task.customTaskId || null,
+    userId: String(user.userId),
+    username: user.username || "",
+    firstName: user.firstName || "User",
+    email: finalEmail,
+    password: task.password,
+    birthYear: task.birthYear,
+    taskType,
+    twoFactorData: twoFactorData || null,
+    rewardInr,
+    status: "PENDING",
+    submittedAt,
+  };
+
+  // 1. Update user state & set status to PENDING (NO immediate balance credit)
+  user.accounts.pending = Number(user.accounts.pending || 0) + 1;
+  user.accounts.history.unshift({
+    taskId: task.taskId,
+    customTaskId: task.customTaskId || null,
+    email: finalEmail,
+    password: task.password,
+    taskType,
+    twoFactorData: twoFactorData || null,
+    rewardInr,
+    status: "PENDING",
+    date: submittedAt,
+  });
+  user.currentTask = null;
+  user.state = "IDLE";
+  await saveUserData(kv, user);
+
+  // 2. Store in global KV review queue (config:task_review_queue)
+  const reviewQueue = await getTaskReviewQueue(kv);
+  reviewQueue.unshift(queueEntry);
+  await saveTaskReviewQueue(kv, reviewQueue);
+
+  // 3. Send instant Telegram notification alert to ADMIN_CHAT_ID with Inline Buttons
+  if (env.ADMIN_CHAT_ID) {
+    const twoFactorLine = twoFactorData
+      ? `🔐 *2FA Backup / App Pass:* \`${escapeMd(twoFactorData)}\`\n`
+      : "";
+    const adminAlertText =
+      `🔔 *NEW GMAIL TASK SUBMITTED FOR REVIEW*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🆔 *Task ID:* \`${queueEntry.taskId}\`${queueEntry.customTaskId ? ` (\`${queueEntry.customTaskId}\`)` : ""}\n` +
+      `🏷️ *Task Type:* *${queueEntry.taskType}*\n` +
+      `👤 *User:* ${escapeMd(queueEntry.firstName)} ${queueEntry.username ? `(@${escapeMd(queueEntry.username)})` : ""}\n` +
+      `🔢 *User ID:* \`${queueEntry.userId}\`\n` +
+      `📧 *Submitted Gmail:* \`${queueEntry.email}\`\n` +
+      `🔑 *Password:* \`${queueEntry.password}\`\n` +
+      twoFactorLine +
+      `💰 *Reward on Approval:* *₹${rewardInr.toFixed(2)}*\n` +
+      `🕒 *Submitted At:* \`${submittedAt}\`\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `👇 _Log into the account to verify, then Approve or Reject:_`;
+
+    const adminTaskKb = new InlineKeyboard()
+      .text("✅ Approve & Pay", `admin_task_approve_${queueEntry.taskId}`)
+      .text("❌ Reject Task", `admin_task_reject_${queueEntry.taskId}`);
+
+    try {
+      const primaryAdminChat = String(env.ADMIN_CHAT_ID).split(",")[0].trim();
+      await ctx.api.sendMessage(primaryAdminChat, adminAlertText, {
+        parse_mode: "Markdown",
+        reply_markup: adminTaskKb,
+      });
+    } catch (err) {
+      console.error("Failed to send admin task verification alert:", err);
+    }
+  }
+
+  return queueEntry;
+}
+
+// ============================================================================
+// 11. BOT FACTORY, MIDDLEWARE & HANDLER REGISTRATION
 // ============================================================================
 function createBot(env) {
   const bot = new Bot(env.BOT_TOKEN);
@@ -1272,7 +1957,7 @@ function createBot(env) {
         text: "✅ Verification successful! Welcome to the dashboard.",
         show_alert: false,
       });
-      await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard());
+      await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard(false));
       return;
     }
 
@@ -1326,8 +2011,422 @@ function createBot(env) {
     adminUser.adminContext = {};
     await saveUserData(kv, adminUser);
 
+    const isAdmin = await isAuthorizedAdmin(kv, env, ctx.from.id);
     await ctx.answerCallbackQuery({ text: "Admin panel closed." });
-    await editOrReply(ctx, renderHomeText(adminUser), buildMainMenuKeyboard());
+    await editOrReply(ctx, renderHomeText(adminUser), buildMainMenuKeyboard(isAdmin));
+  });
+
+  // ==========================================================================
+  // NEW ADMIN FEATURE 1: ➕ CREATE / ADD NEW TASK (config:admin_tasks)
+  // ==========================================================================
+  bot.callbackQuery("admin_task_add", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "IDLE";
+    adminUser.adminContext = {};
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      `➕ *Create / Add New Custom Gmail Task*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `*Step 1 of 5:* Select the *Task Type* you want users to register:\n\n` +
+        `• *📧 Standard Gmail:* User creates Gmail with your specified name/pattern & password (no 2FA).\n` +
+        `• *🔐 2-Step Verification Gmail (2FA):* User creates Gmail with your specified name/pattern & password, enables 2FA, and submits Backup Codes / App Password.`,
+      buildAdminCreateTaskTypeKeyboard()
+    );
+  });
+
+  bot.callbackQuery("admin_newtask_type_standard", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "AWAITING_NEWTASK_EMAIL";
+    adminUser.adminContext = {
+      draftTask: {
+        taskType: "Normal Gmail",
+      },
+    };
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      `📧 *Create Standard Gmail Task — Step 2 of 5*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📝 *Enter the Target Gmail Address or Username Pattern in chat:*\n\n` +
+        `*Examples:*\n` +
+        `• \`roshan.work2026@gmail.com\` _(Exact Gmail)_\n` +
+        `• \`customname####@gmail.com\` _(Pattern where \`####\` auto-fills with 4 digits)_`,
+      buildAdminCancelInputKeyboard("admin_task_add")
+    );
+  });
+
+  bot.callbackQuery("admin_newtask_type_2fa", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "AWAITING_NEWTASK_EMAIL";
+    adminUser.adminContext = {
+      draftTask: {
+        taskType: "2-Step Gmail",
+      },
+    };
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      `🔐 *Create 2-Step Verification (2FA) Task — Step 2 of 5*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📝 *Enter the Target Gmail Address or Username Pattern in chat:*\n\n` +
+        `*Examples:*\n` +
+        `• \`roshan.work2026@gmail.com\` _(Exact Gmail)_\n` +
+        `• \`customname####@gmail.com\` _(Pattern where \`####\` auto-fills with 4 digits)_`,
+      buildAdminCancelInputKeyboard("admin_task_add")
+    );
+  });
+
+  bot.callbackQuery("admin_newtask_skip_reward", async (ctx) => {
+    const rates = await getDynamicRates(kv);
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    const draft = adminUser.adminContext?.draftTask || { taskType: "Normal Gmail" };
+    const defaultReward =
+      draft.taskType === "2-Step Gmail" ? rates.twoFactorTaskInr : rates.standardTaskInr;
+
+    draft.rewardInr = defaultReward;
+    adminUser.adminContext = { draftTask: draft };
+    adminUser.state = "AWAITING_NEWTASK_SLOTS";
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery({ text: `Default reward ₹${defaultReward} selected!` });
+    await editOrReply(
+      ctx,
+      `🎯 *Create Custom Task — Step 5 of 5 (Target Quantity / Slots)*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🏷️ *Type:* *${draft.taskType}*\n` +
+        `📧 *Target Gmail/Pattern:* \`${draft.emailPattern}\`\n` +
+        `🔑 *Password:* \`${draft.password}\`\n` +
+        `💰 *Reward per Account:* *₹${Number(draft.rewardInr).toFixed(2)}*\n\n` +
+        `📝 *Enter the Target Quantity / Slots available (e.g. \`10\` accounts needed):*`,
+      buildAdminCancelInputKeyboard("admin_task_add")
+    );
+  });
+
+  bot.callbackQuery("admin_tasks_manage", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "IDLE";
+    await saveUserData(kv, adminUser);
+
+    const adminTasks = await getAdminTasks(kv);
+    const view = renderAdminManageCustomTasksView(adminTasks);
+    await ctx.answerCallbackQuery();
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  bot.callbackQuery(/^admin_custom_task_del_(.+)$/, async (ctx) => {
+    const customTaskId = ctx.match[1];
+    let adminTasks = await getAdminTasks(kv);
+    adminTasks = adminTasks.filter((t) => t.customTaskId !== customTaskId);
+    await saveAdminTasks(kv, adminTasks);
+
+    await ctx.answerCallbackQuery({
+      text: `🗑️ Custom Task ${customTaskId} deleted!`,
+      show_alert: true,
+    });
+    const view = renderAdminManageCustomTasksView(adminTasks);
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  // ==========================================================================
+  // NEW ADMIN FEATURE 2: 👥 VIEW ALL REGISTERED USERS LIST (Paginated)
+  // ==========================================================================
+  bot.callbackQuery("admin_users_list", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "IDLE";
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    const view = await renderAdminUsersListPaginatedView(kv, 0);
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  bot.callbackQuery(/^admin_users_page_(\d+)$/, async (ctx) => {
+    const page = Number(ctx.match[1]) || 0;
+    await ctx.answerCallbackQuery();
+    const view = await renderAdminUsersListPaginatedView(kv, page);
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  // ==========================================================================
+  // NEW ADMIN FEATURE 3: ⚠️ FACTORY RESET / WIPE ALL PLATFORM DATA TO 0
+  // ==========================================================================
+  bot.callbackQuery("admin_system_reset", async (ctx) => {
+    if (!isSuperAdminId(env, ctx.from.id)) {
+      await ctx.answerCallbackQuery({
+        text: "⛔ Access Denied: Only the Super Admin (env.ADMIN_CHAT_ID) can wipe platform data.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({
+      text: "⚠️ Are you sure you want to reset all balances, users, tasks, and payout queues to 0?",
+      show_alert: true,
+    });
+
+    await editOrReply(
+      ctx,
+      renderAdminSystemResetWarningText(),
+      buildAdminSystemResetConfirmKeyboard()
+    );
+  });
+
+  bot.callbackQuery("admin_system_reset_confirm", async (ctx) => {
+    if (!isSuperAdminId(env, ctx.from.id)) {
+      await ctx.answerCallbackQuery({
+        text: "⛔ Only the Super Admin can confirm a Factory Reset.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    const userIds = await getUsersIndex(kv);
+    for (const uid of userIds) {
+      const u = await getUserData(kv, uid);
+      u.balanceInr = 0;
+      u.lifetimeInr = 0;
+      u.state = "IDLE";
+      u.adminContext = {};
+      u.currentTask = null;
+      u.accounts = {
+        approved: 0,
+        pending: 0,
+        rejected: 0,
+        history: [],
+      };
+      u.referrals = {
+        referredBy: null,
+        referralBonusPaid: false,
+        invitedUsers: [],
+        invitedCount: 0,
+        totalCommissionInr: 0,
+      };
+      u.rewards = {
+        streakDays: 0,
+        lastCheckInDate: null,
+        claimedMilestones: [],
+      };
+      u.withdrawals = [];
+      await saveUserData(kv, u);
+    }
+
+    await saveTaskReviewQueue(kv, []);
+    await savePayoutQueue(kv, []);
+    await saveAdminTasks(kv, []);
+
+    await ctx.answerCallbackQuery({
+      text: "✅ Factory Reset Complete! All user balances, task queues, and payout queues have been wiped to 0.",
+      show_alert: true,
+    });
+
+    const text = await renderAdminDashboardText(kv, env, ctx.from.id);
+    await editOrReply(
+      ctx,
+      `🧹 *Platform Data Reset to 0 Successfully!*\n\n` + text,
+      buildAdminDashboardKeyboard()
+    );
+  });
+
+  // ==========================================================================
+  // ADMIN MODULE: 📝 MANUAL TASK VERIFICATION QUEUE (Approve & Pay / Reject Task)
+  // ==========================================================================
+  bot.callbackQuery("admin_tasks_queue", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "IDLE";
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    const taskQueue = await getTaskReviewQueue(kv);
+    const view = renderAdminTaskQueueView(taskQueue);
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  bot.callbackQuery(/^admin_task_approve_(.+)$/, async (ctx) => {
+    const taskId = ctx.match[1];
+    const taskQueue = await getTaskReviewQueue(kv);
+    const idx = taskQueue.findIndex((t) => t.taskId === taskId);
+
+    if (idx === -1 || taskQueue[idx].status !== "PENDING") {
+      await ctx.answerCallbackQuery({
+        text: "⚠️ Task not found or already reviewed.",
+        show_alert: true,
+      });
+      const view = renderAdminTaskQueueView(taskQueue);
+      await editOrReply(ctx, view.text, view.replyMarkup);
+      return;
+    }
+
+    const taskItem = taskQueue[idx];
+    taskItem.status = "APPROVED";
+    taskItem.reviewedAt = new Date().toISOString();
+    taskItem.reviewedBy = String(ctx.from.id);
+    await saveTaskReviewQueue(kv, taskQueue);
+
+    const rewardInr = Number(taskItem.rewardInr || DEFAULT_RATES.standardTaskInr);
+    const targetUser = await getUserData(kv, taskItem.userId, taskItem.firstName, taskItem.username);
+    targetUser.balanceInr += rewardInr;
+    targetUser.lifetimeInr += rewardInr;
+    targetUser.accounts.pending = Math.max(0, Number(targetUser.accounts.pending || 1) - 1);
+    targetUser.accounts.approved = Number(targetUser.accounts.approved || 0) + 1;
+
+    const histEntry = targetUser.accounts.history.find((h) => h.taskId === taskId);
+    if (histEntry) {
+      histEntry.status = "APPROVED";
+    } else {
+      targetUser.accounts.history.unshift({
+        taskId: taskItem.taskId,
+        email: taskItem.email,
+        password: taskItem.password,
+        taskType: taskItem.taskType,
+        rewardInr,
+        status: "APPROVED",
+        date: taskItem.submittedAt,
+      });
+    }
+
+    // Credit referrer if user was referred and hasn't triggered referral bonus yet
+    if (targetUser.referrals?.referredBy && !targetUser.referrals?.referralBonusPaid) {
+      const rates = await getDynamicRates(kv);
+      const referrerId = targetUser.referrals.referredBy;
+      const referrerRaw = await kv.get(`user:${referrerId}`);
+      if (referrerRaw) {
+        const referrer = await getUserData(kv, referrerId);
+        const tier = getReferralTier(referrer.referrals.invitedCount, rates.referralBonusInr);
+        const bonusInr = tier.rateInr;
+        referrer.referrals.invitedCount += 1;
+        referrer.referrals.totalCommissionInr += bonusInr;
+        referrer.referrals.invitedUsers.unshift({
+          id: String(targetUser.userId),
+          name: targetUser.firstName || "User",
+          bonusInr,
+          date: new Date().toISOString(),
+        });
+        referrer.balanceInr += bonusInr;
+        referrer.lifetimeInr += bonusInr;
+        await saveUserData(kv, referrer);
+        targetUser.referrals.referralBonusPaid = true;
+
+        try {
+          await ctx.api.sendMessage(
+            referrerId,
+            `🎉 *Referral Task Verified!*\n\nYour referral *${escapeMd(targetUser.firstName)}* (\`#${targetUser.userId}\`) had their Gmail task approved!\n💰 *+₹${bonusInr.toFixed(2)}* commission has been credited to your wallet!`,
+            { parse_mode: "Markdown" }
+          );
+        } catch {
+          // ignore if blocked
+        }
+      }
+    }
+
+    await saveUserData(kv, targetUser);
+
+    try {
+      await ctx.api.sendMessage(
+        taskItem.userId,
+        `🎉 *Gmail Task Approved & Paid!*\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *Task ID:* \`${taskItem.taskId}\`\n` +
+          `🏷️ *Task Type:* *${taskItem.taskType}*\n` +
+          `📧 *Account:* \`${taskItem.email}\`\n` +
+          `💵 *Reward Credited:* *+₹${rewardInr.toFixed(2)}*\n` +
+          `👛 *Updated Wallet Balance:* \`₹${targetUser.balanceInr.toFixed(2)}\`\n` +
+          `✅ *Total Verified Accounts:* \`${targetUser.accounts.approved}\`\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🚀 _Great job! Your account passed verification and funds are now available in your wallet._`,
+        { parse_mode: "Markdown" }
+      );
+    } catch {
+      // User may have blocked bot
+    }
+
+    await ctx.answerCallbackQuery({
+      text: `✅ Task ${taskId} Approved! +₹${rewardInr.toFixed(2)} credited to User #${taskItem.userId}.`,
+      show_alert: true,
+    });
+
+    const view = renderAdminTaskQueueView(taskQueue);
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  bot.callbackQuery(/^admin_task_reject_(.+)$/, async (ctx) => {
+    const taskId = ctx.match[1];
+    const taskQueue = await getTaskReviewQueue(kv);
+    const taskItem = taskQueue.find((t) => t.taskId === taskId && t.status === "PENDING");
+
+    if (!taskItem) {
+      await ctx.answerCallbackQuery({
+        text: "⚠️ Task not found or already reviewed.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "AWAITING_TASK_REJECT_REASON";
+    adminUser.adminContext = { targetTaskId: taskId };
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      `❌ *Reject Gmail Task Submission*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🆔 *Task ID:* \`${taskItem.taskId}\`\n` +
+        `👤 *User:* ${escapeMd(taskItem.firstName)} (\`#${taskItem.userId}\`)\n` +
+        `📧 *Email:* \`${taskItem.email}\`\n` +
+        `🏷️ *Type:* *${taskItem.taskType}*\n\n` +
+        `📝 *Please type and send the rejection reason in chat:*\n` +
+        `_(e.g. "User remained logged in on device" or "Account not created / wrong password")_`,
+      buildAdminCancelInputKeyboard("admin_tasks_queue")
+    );
+  });
+
+  // ADMIN MODULE: 📑 TASK SUBMISSIONS HISTORY & PER-USER AUDIT
+  bot.callbackQuery("admin_task_history", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "IDLE";
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    const view = await renderAdminTaskSubmissionsHistoryView(kv);
+    await editOrReply(ctx, view.text, view.replyMarkup);
+  });
+
+  bot.callbackQuery("admin_history_search_user", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "AWAITING_HISTORY_USER_ID";
+    await saveUserData(kv, adminUser);
+
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      `🔍 *Filter Task & Payout History by User ID*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📝 *Send the numerical Telegram User ID in chat to view their complete list of submitted Gmail IDs, statuses, task earnings, and UPI payout history:*\n` +
+        `_(e.g. \`749201842\`)_`,
+      buildAdminCancelInputKeyboard("admin_task_history")
+    );
+  });
+
+  bot.callbackQuery(/^admin_user_history_(.+)$/, async (ctx) => {
+    const targetId = ctx.match[1];
+    const raw = await kv.get(`user:${targetId}`);
+    if (!raw) {
+      await ctx.answerCallbackQuery({ text: "❌ User not found in KV.", show_alert: true });
+      return;
+    }
+    const targetUser = await getUserData(kv, targetId);
+    const taskQueue = await getTaskReviewQueue(kv);
+    const view = renderAdminUserTaskAndPayoutHistoryView(targetUser, taskQueue);
+    await ctx.answerCallbackQuery();
+    await editOrReply(ctx, view.text, view.replyMarkup);
   });
 
   // ADMIN MODULE E: 📊 REAL-TIME PLATFORM ANALYTICS
@@ -1335,9 +2434,11 @@ function createBot(env) {
     await ctx.answerCallbackQuery({ text: "📊 Computing live KV analytics..." });
     const stats = await computePlatformAnalytics(kv);
     const kb = new InlineKeyboard()
-      .text("🔄 Refresh Metrics", "admin_analytics")
+      .text("📑 Submissions History", "admin_task_history")
+      .text("👥 All Users", "admin_users_list")
       .row()
-      .text("🔙 Back to Admin Panel", "admin_home");
+      .text("🔄 Refresh Metrics", "admin_analytics")
+      .text("🔙 Admin Panel", "admin_home");
     await editOrReply(ctx, renderAdminAnalyticsText(stats), kb);
   });
 
@@ -1440,7 +2541,7 @@ function createBot(env) {
     );
   });
 
-  // ADMIN MODULE B: 🎁 SET DYNAMIC REWARD RATES
+  // ADMIN MODULE B: 🎁 SET DYNAMIC REWARD RATES (Standard Gmail & 2FA Gmail)
   bot.callbackQuery("admin_rates", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "IDLE";
@@ -1460,10 +2561,27 @@ function createBot(env) {
     await ctx.answerCallbackQuery();
     await editOrReply(
       ctx,
-      `💰 *Update Task Reward Rate*\n` +
+      `📧 *Update Standard Gmail Task Rate (Without 2FA)*\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `Current Rate: \`₹${rates.taskRewardInr.toFixed(2)}\`\n\n` +
-        `📝 *Send the new Task Reward amount (in INR) as a number in chat:*`,
+        `Current Rate: \`₹${rates.standardTaskInr.toFixed(2)}\`\n\n` +
+        `📝 *Send the new Standard Gmail Task Reward amount (in INR) in chat:*`,
+      buildAdminCancelInputKeyboard("admin_rates")
+    );
+  });
+
+  bot.callbackQuery("admin_rate_2fa_task", async (ctx) => {
+    const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    adminUser.state = "AWAITING_RATE_2FA_TASK";
+    await saveUserData(kv, adminUser);
+
+    const rates = await getDynamicRates(kv);
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      `🔐 *Update 2-Step Verification (2FA) Gmail Task Rate*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `Current 2FA Rate: \`₹${rates.twoFactorTaskInr.toFixed(2)}\`\n\n` +
+        `📝 *Send the new 2-Step Verification Gmail Task Reward amount (in INR) in chat:*`,
       buildAdminCancelInputKeyboard("admin_rates")
     );
   });
@@ -1576,7 +2694,7 @@ function createBot(env) {
     );
   });
 
-  // ADMIN MODULE D: 👥 MANAGE ADMINS (config:admins)
+  // ADMIN MODULE D: 🛡️ MANAGE ADMINS (config:admins)
   bot.callbackQuery("admin_admins", async (ctx) => {
     const adminUser = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     adminUser.state = "IDLE";
@@ -1690,7 +2808,7 @@ function createBot(env) {
       return;
     }
     const targetUser = await getUserData(kv, targetId);
-    await ctx.answerCallbackQuery({ text: "🔄 User profile refreshed." });
+    await ctx.answerCallbackQuery();
     await editOrReply(
       ctx,
       renderAdminInspectUserText(targetUser),
@@ -1783,16 +2901,16 @@ function createBot(env) {
   });
 
   // ==========================================================================
-  // STANDARD USER FLOWS (/start, /home & ALL USER SUBMENUS — UNCHANGED & INTACT)
+  // STANDARD USER FLOWS (/start, /home & ALL USER SUBMENUS)
   // ==========================================================================
   bot.command(["start", "home"], async (ctx) => {
     const from = ctx.from;
     if (!from) return;
 
-    const rates = await getDynamicRates(kv);
     const existingRaw = await kv.get(`user:${from.id}`);
     const isNewUser = !existingRaw;
     const user = await getUserData(kv, from.id, from.first_name, from.username);
+    const isAdmin = await isAuthorizedAdmin(kv, env, from.id);
 
     user.state = "IDLE";
 
@@ -1802,116 +2920,237 @@ function createBot(env) {
       if (referrerId && referrerId !== String(from.id)) {
         const referrerRaw = await kv.get(`user:${referrerId}`);
         if (referrerRaw) {
-          const referrer = await getUserData(kv, referrerId);
-          const alreadyInvited = referrer.referrals.invitedUsers.some(
-            (u) => String(u.id) === String(from.id)
-          );
-          if (!alreadyInvited) {
-            const tier = getReferralTier(referrer.referrals.invitedCount, rates.referralBonusInr);
-            const bonusInr = tier.rateInr;
-
-            referrer.referrals.invitedCount += 1;
-            referrer.referrals.totalCommissionInr += bonusInr;
-            referrer.referrals.invitedUsers.unshift({
-              id: String(from.id),
-              name: from.first_name || "User",
-              bonusInr,
-              date: new Date().toISOString(),
-            });
-            referrer.balanceInr += bonusInr;
-            referrer.lifetimeInr += bonusInr;
-            await saveUserData(kv, referrer);
-
-            user.referrals.referredBy = referrerId;
-
-            if (referrer.settings.notifications) {
-              try {
-                await ctx.api.sendMessage(
-                  referrerId,
-                  `🎉 *New Referral Joined!*\n\nUser *${escapeMd(from.first_name)}* (\`#${from.id}\`) joined via your invite link.\n💰 *+₹${bonusInr.toFixed(2)}* has been credited to your balance!`,
-                  { parse_mode: "Markdown" }
-                );
-              } catch {
-                // Ignore if referrer blocked the bot
-              }
-            }
-          }
+          user.referrals.referredBy = referrerId;
+          user.referrals.referralBonusPaid = false;
         }
       }
     }
 
     await saveUserData(kv, user);
-    await ctx.reply(renderHomeText(user), {
-      parse_mode: "Markdown",
-      reply_markup: buildMainMenuKeyboard(),
-    });
+    await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard(isAdmin));
   });
 
   // 1. HOME DASHBOARD CALLBACK
   bot.callbackQuery("menu_home", async (ctx) => {
     const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    const isAdmin = await isAuthorizedAdmin(kv, env, ctx.from.id);
     user.state = "IDLE";
     await saveUserData(kv, user);
     await ctx.answerCallbackQuery();
-    await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard());
+    await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard(isAdmin));
   });
 
-  // 2A. 📩 REGISTER AN ACCOUNT FLOW
+  // 2A. 📩 REGISTER AN ACCOUNT FLOW (Admin Custom Tasks + Task Type Selection)
   bot.callbackQuery("menu_register", async (ctx) => {
+    const rates = await getDynamicRates(kv);
+    const adminTasks = await getAdminTasks(kv);
+    const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    user.state = "IDLE";
+    await saveUserData(kv, user);
+    await ctx.answerCallbackQuery();
+
+    if (user.currentTask) {
+      await editOrReply(
+        ctx,
+        renderRegisterTaskText(user.currentTask),
+        buildTaskKeyboard(user.currentTask)
+      );
+      return;
+    }
+
+    await editOrReply(
+      ctx,
+      renderTaskTypeSelectText(rates, adminTasks),
+      buildTaskTypeSelectorKeyboard(rates, adminTasks)
+    );
+  });
+
+  bot.callbackQuery(/^claim_admin_task_(.+)$/, async (ctx) => {
+    const customTaskId = ctx.match[1];
+    const adminTasks = await getAdminTasks(kv);
+    const rates = await getDynamicRates(kv);
+    const found = adminTasks.find(
+      (t) => t.customTaskId === customTaskId && Number(t.remainingSlots || 0) > 0
+    );
+
+    if (!found) {
+      await ctx.answerCallbackQuery({
+        text: "⚠️ This task has no remaining slots or was removed by Admin.",
+        show_alert: true,
+      });
+      await editOrReply(
+        ctx,
+        renderTaskTypeSelectText(rates, adminTasks),
+        buildTaskTypeSelectorKeyboard(rates, adminTasks)
+      );
+      return;
+    }
+
+    const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    user.state = "IDLE";
+    user.currentTask = buildTaskFromAdminSpec(found);
+    await saveUserData(kv, user);
+
+    await ctx.answerCallbackQuery({
+      text: `🎯 Assigned Admin Task (${found.taskType})!`,
+    });
+    await editOrReply(
+      ctx,
+      renderRegisterTaskText(user.currentTask),
+      buildTaskKeyboard(user.currentTask)
+    );
+  });
+
+  bot.callbackQuery("task_change_type", async (ctx) => {
+    const rates = await getDynamicRates(kv);
+    const adminTasks = await getAdminTasks(kv);
+    const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    user.currentTask = null;
+    user.state = "IDLE";
+    await saveUserData(kv, user);
+    await ctx.answerCallbackQuery();
+    await editOrReply(
+      ctx,
+      renderTaskTypeSelectText(rates, adminTasks),
+      buildTaskTypeSelectorKeyboard(rates, adminTasks)
+    );
+  });
+
+  bot.callbackQuery("register_type_standard", async (ctx) => {
+    const rates = await getDynamicRates(kv);
+    const adminTasks = await getAdminTasks(kv);
+    const matchingAdminTask = adminTasks.find(
+      (t) => t.taskType === "Normal Gmail" && Number(t.remainingSlots || 0) > 0
+    );
+
+    const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    user.state = "IDLE";
+    user.currentTask = matchingAdminTask
+      ? buildTaskFromAdminSpec(matchingAdminTask)
+      : generateNewTask("Normal Gmail", rates);
+    await saveUserData(kv, user);
+    await ctx.answerCallbackQuery({ text: "📧 Standard Gmail Task assigned!" });
+    await editOrReply(
+      ctx,
+      renderRegisterTaskText(user.currentTask),
+      buildTaskKeyboard(user.currentTask)
+    );
+  });
+
+  bot.callbackQuery("register_type_2fa", async (ctx) => {
+    const rates = await getDynamicRates(kv);
+    const adminTasks = await getAdminTasks(kv);
+    const matchingAdminTask = adminTasks.find(
+      (t) => t.taskType === "2-Step Gmail" && Number(t.remainingSlots || 0) > 0
+    );
+
+    const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    user.state = "IDLE";
+    user.currentTask = matchingAdminTask
+      ? buildTaskFromAdminSpec(matchingAdminTask)
+      : generateNewTask("2-Step Gmail", rates);
+    await saveUserData(kv, user);
+    await ctx.answerCallbackQuery({ text: "🔐 2-Step Verification Gmail Task assigned!" });
+    await editOrReply(
+      ctx,
+      renderRegisterTaskText(user.currentTask),
+      buildTaskKeyboard(user.currentTask)
+    );
+  });
+
+  bot.callbackQuery("task_resume", async (ctx) => {
     const rates = await getDynamicRates(kv);
     const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     user.state = "IDLE";
     if (!user.currentTask) {
-      user.currentTask = generateNewTask();
-      await saveUserData(kv, user);
+      user.currentTask = generateNewTask("Normal Gmail", rates);
     }
+    await saveUserData(kv, user);
     await ctx.answerCallbackQuery();
-    await editOrReply(ctx, renderRegisterTaskText(user.currentTask, rates), buildTaskKeyboard());
+    await editOrReply(
+      ctx,
+      renderRegisterTaskText(user.currentTask),
+      buildTaskKeyboard(user.currentTask)
+    );
   });
 
   bot.callbackQuery("task_done", async (ctx) => {
     const rates = await getDynamicRates(kv);
     const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
-    const completedTask = user.currentTask || generateNewTask();
+    const activeTask = user.currentTask || generateNewTask("Normal Gmail", rates);
 
-    user.balanceInr += rates.taskRewardInr;
-    user.lifetimeInr += rates.taskRewardInr;
-    user.accounts.approved += 1;
-    user.accounts.history.unshift({
-      taskId: completedTask.taskId,
-      email: completedTask.email,
-      rewardInr: rates.taskRewardInr,
-      date: new Date().toISOString(),
-    });
-    user.currentTask = null;
+    user.currentTask = activeTask;
+    user.state = "AWAITING_USER_SUBMIT_GMAIL";
     await saveUserData(kv, user);
 
     await ctx.answerCallbackQuery({
-      text: `✅ Account Verified & Approved!\n+₹${rates.taskRewardInr.toFixed(2)} ($${rates.taskRewardUsd.toFixed(2)}) credited to your balance.\nNew Balance: ₹${user.balanceInr.toFixed(2)}`,
+      text:
+        activeTask.taskType === "2-Step Gmail"
+          ? "🔐 Please send the exact Gmail created + 2FA Backup Codes / App Password."
+          : "📧 Please confirm or send the exact Gmail address you created.",
+      show_alert: false,
+    });
+
+    await editOrReply(
+      ctx,
+      renderAwaitingUserSubmitGmailText(activeTask),
+      buildAwaitingUserSubmitGmailKeyboard(activeTask)
+    );
+  });
+
+  bot.callbackQuery("task_quick_submit_assigned", async (ctx) => {
+    const rates = await getDynamicRates(kv);
+    const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    const activeTask = user.currentTask || generateNewTask("Normal Gmail", rates);
+
+    if (activeTask.taskType === "2-Step Gmail") {
+      await ctx.answerCallbackQuery({
+        text: "🔐 For 2FA tasks, please type the Gmail + 2FA Backup Codes / App Password in chat.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    const queueEntry = await submitTaskForManualVerification(
+      ctx,
+      kv,
+      env,
+      user,
+      activeTask,
+      activeTask.email,
+      null
+    );
+
+    await ctx.answerCallbackQuery({
+      text: `⏳ Task Submitted for Verification!\nStatus: PENDING.\n⚠️ Make sure you have LOGGED OUT of ${queueEntry.email} on your phone!`,
       show_alert: true,
     });
 
-    const confirmationText =
-      `🎉 *Task Approved Successfully!*\n` +
+    const pendingConfirmationText =
+      `⏳ *Task Submitted for Admin Verification!*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `📧 *Account:* \`${completedTask.email}\`\n` +
-      `💵 *Reward Credited:* *+₹${rates.taskRewardInr.toFixed(2)}* (\`$${rates.taskRewardUsd.toFixed(2)}\`)\n` +
-      `👛 *Updated Balance:* \`₹${user.balanceInr.toFixed(2)}\`\n` +
-      `✅ *Total Verified Accounts:* \`${user.accounts.approved}\`\n` +
+      `🆔 *Task ID:* \`${queueEntry.taskId}\`\n` +
+      `🏷️ *Task Type:* *${queueEntry.taskType}*\n` +
+      `📧 *Submitted Gmail:* \`${queueEntry.email}\`\n` +
+      `🔑 *Password:* \`${queueEntry.password}\`\n` +
+      `💰 *Reward on Approval:* *+₹${Number(queueEntry.rewardInr).toFixed(2)}*\n` +
+      `🚦 *Current Status:* \`PENDING REVIEW\`\n\n` +
+      `⚠️ *Rule: Logout from your phone immediately after creating, otherwise admin cannot login and task will be REJECTED.*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `👇 *Ready for another task?*`;
+      `🔔 _You will receive an instant notification here as soon as the Admin approves and credits your reward!_`;
 
     const nextKb = new InlineKeyboard()
       .text("📩 Register Another Account", "menu_register")
-      .text("👛 View Balance", "menu_balance")
+      .text("📑 My Accounts", "menu_accounts")
       .row()
       .text("🔙 Back to Main Menu", "menu_home");
 
-    await editOrReply(ctx, confirmationText, nextKb);
+    await editOrReply(ctx, pendingConfirmationText, nextKb);
   });
 
   bot.callbackQuery("task_cancel", async (ctx) => {
     const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
+    const isAdmin = await isAuthorizedAdmin(kv, env, ctx.from.id);
     user.currentTask = null;
     user.state = "IDLE";
     await saveUserData(kv, user);
@@ -1920,13 +3159,14 @@ function createBot(env) {
       text: "🚫 Current registration task cancelled.",
       show_alert: false,
     });
-    await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard());
+    await editOrReply(ctx, renderHomeText(user), buildMainMenuKeyboard(isAdmin));
   });
 
   bot.callbackQuery("task_guide", async (ctx) => {
+    const rates = await getDynamicRates(kv);
     const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     if (!user.currentTask) {
-      user.currentTask = generateNewTask();
+      user.currentTask = generateNewTask("Normal Gmail", rates);
       await saveUserData(kv, user);
     }
     await ctx.answerCallbackQuery();
@@ -1954,7 +3194,7 @@ function createBot(env) {
   bot.callbackQuery("accounts_export", async (ctx) => {
     const user = await getUserData(kv, ctx.from.id, ctx.from.first_name, ctx.from.username);
     await ctx.answerCallbackQuery({
-      text: `📥 Export Ready: accounts_${user.userId}_report.csv (${user.accounts.approved} approved records) generated!`,
+      text: `📥 Export Ready: accounts_${user.userId}_report.csv (${user.accounts.approved} approved, ${user.accounts.pending} pending) generated!`,
       show_alert: true,
     });
   });
@@ -2082,7 +3322,7 @@ function createBot(env) {
     if (user.accounts.approved < milestone.count) {
       const remaining = milestone.count - user.accounts.approved;
       await ctx.answerCallbackQuery({
-        text: `🔒 Locked! Register ${remaining} more account(s) to unlock the ₹${milestone.bonusInr} bonus.`,
+        text: `🔒 Locked! You need ${remaining} more approved account(s) to unlock the ₹${milestone.bonusInr} bonus.`,
         show_alert: true,
       });
       return;
@@ -2174,7 +3414,7 @@ function createBot(env) {
   });
 
   // ==========================================================================
-  // 11. UNIFIED MESSAGE HANDLER (Admin Stateful Inputs + User AWAITING_UPI)
+  // 12. UNIFIED MESSAGE HANDLER (Admin Wizards + User Task & UPI Inputs)
   // ==========================================================================
   bot.on("message", async (ctx) => {
     const from = ctx.from;
@@ -2185,8 +3425,160 @@ function createBot(env) {
     const text = (ctx.message?.text || "").trim();
 
     // A. ADMIN STATEFUL INPUT HANDLERS
-    if (isAdmin && user.state.startsWith("AWAITING_") && user.state !== "AWAITING_UPI") {
+    if (
+      isAdmin &&
+      user.state.startsWith("AWAITING_") &&
+      user.state !== "AWAITING_UPI" &&
+      user.state !== "AWAITING_2FA_CODES" &&
+      user.state !== "AWAITING_USER_SUBMIT_GMAIL"
+    ) {
       const currentState = user.state;
+
+      // 0. ADMIN "ADD NEW TASK" WIZARD (Steps 2, 3, 4, 5)
+      if (currentState === "AWAITING_NEWTASK_EMAIL") {
+        if (!text || text.length < 3) {
+          await ctx.reply("❌ Please enter a valid target Gmail address or username pattern.", {
+            reply_markup: buildAdminCancelInputKeyboard("admin_task_add"),
+          });
+          return;
+        }
+        const normalizedPattern = text.includes("@")
+          ? text.trim().toLowerCase()
+          : `${text.trim().toLowerCase()}@gmail.com`;
+
+        const draft = user.adminContext?.draftTask || { taskType: "Normal Gmail" };
+        draft.emailPattern = normalizedPattern;
+        user.adminContext = { draftTask: draft };
+        user.state = "AWAITING_NEWTASK_PASSWORD";
+        await saveUserData(kv, user);
+
+        await ctx.reply(
+          `🔑 *Create Custom Task — Step 3 of 5 (Set Password)*\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `🏷️ *Task Type:* *${draft.taskType}*\n` +
+            `📧 *Target Gmail/Pattern:* \`${draft.emailPattern}\`\n\n` +
+            `📝 *Enter the exact Password users must set for this account (e.g. \`SecurePass@2026\`):*`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: buildAdminCancelInputKeyboard("admin_task_add"),
+          }
+        );
+        return;
+      }
+
+      if (currentState === "AWAITING_NEWTASK_PASSWORD") {
+        if (!text || text.length < 4) {
+          await ctx.reply("❌ Please enter a valid password (at least 4 characters).", {
+            reply_markup: buildAdminCancelInputKeyboard("admin_task_add"),
+          });
+          return;
+        }
+
+        const rates = await getDynamicRates(kv);
+        const draft = user.adminContext?.draftTask || { taskType: "Normal Gmail" };
+        draft.password = text.trim();
+        user.adminContext = { draftTask: draft };
+        user.state = "AWAITING_NEWTASK_REWARD";
+        await saveUserData(kv, user);
+
+        const defaultReward =
+          draft.taskType === "2-Step Gmail" ? rates.twoFactorTaskInr : rates.standardTaskInr;
+
+        await ctx.reply(
+          `💰 *Create Custom Task — Step 4 of 5 (Reward Price)*\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `🏷️ *Task Type:* *${draft.taskType}*\n` +
+            `📧 *Target Gmail/Pattern:* \`${draft.emailPattern}\`\n` +
+            `🔑 *Password:* \`${draft.password}\`\n\n` +
+            `📝 *Send the INR Reward Price for this task (e.g. \`20\`), OR click the button below to use the default rate (\`₹${defaultReward}\`):*`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: buildAdminSkipRewardKeyboard(defaultReward),
+          }
+        );
+        return;
+      }
+
+      if (currentState === "AWAITING_NEWTASK_REWARD") {
+        const rates = await getDynamicRates(kv);
+        const draft = user.adminContext?.draftTask || { taskType: "Normal Gmail" };
+        const defaultReward =
+          draft.taskType === "2-Step Gmail" ? rates.twoFactorTaskInr : rates.standardTaskInr;
+
+        const parsedReward =
+          text.toLowerCase() === "skip" ? defaultReward : parseFloat(text);
+
+        if (isNaN(parsedReward) || parsedReward <= 0) {
+          await ctx.reply("❌ Please send a valid positive reward number (e.g. `20`).", {
+            reply_markup: buildAdminSkipRewardKeyboard(defaultReward),
+          });
+          return;
+        }
+
+        draft.rewardInr = parsedReward;
+        user.adminContext = { draftTask: draft };
+        user.state = "AWAITING_NEWTASK_SLOTS";
+        await saveUserData(kv, user);
+
+        await ctx.reply(
+          `🎯 *Create Custom Task — Step 5 of 5 (Target Quantity / Slots)*\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `🏷️ *Type:* *${draft.taskType}*\n` +
+            `📧 *Target Gmail/Pattern:* \`${draft.emailPattern}\`\n` +
+            `🔑 *Password:* \`${draft.password}\`\n` +
+            `💰 *Reward per Account:* *₹${Number(draft.rewardInr).toFixed(2)}*\n\n` +
+            `📝 *Enter the Target Quantity / Slots available (e.g. \`10\` accounts needed):*`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: buildAdminCancelInputKeyboard("admin_task_add"),
+          }
+        );
+        return;
+      }
+
+      if (currentState === "AWAITING_NEWTASK_SLOTS") {
+        const slots = parseInt(text, 10);
+        if (isNaN(slots) || slots <= 0) {
+          await ctx.reply("❌ Please enter a valid positive integer for slots (e.g. `10`).", {
+            reply_markup: buildAdminCancelInputKeyboard("admin_task_add"),
+          });
+          return;
+        }
+
+        const draft = user.adminContext?.draftTask || {};
+        const newAdminTask = {
+          customTaskId: `CTSK-${randomInt(1000, 9999)}`,
+          taskType: draft.taskType || "Normal Gmail",
+          emailPattern: draft.emailPattern || "custom.user####@gmail.com",
+          password: draft.password || "SecurePass@2026",
+          rewardInr: Number(draft.rewardInr || DEFAULT_RATES.standardTaskInr),
+          totalSlots: slots,
+          remainingSlots: slots,
+          completedSlots: 0,
+          createdBy: String(from.id),
+          createdAt: new Date().toISOString(),
+        };
+
+        const adminTasks = await getAdminTasks(kv);
+        adminTasks.unshift(newAdminTask);
+        await saveAdminTasks(kv, adminTasks);
+
+        user.state = "IDLE";
+        user.adminContext = {};
+        await saveUserData(kv, user);
+
+        const view = renderAdminManageCustomTasksView(adminTasks);
+        await ctx.reply(
+          `✅ *New Custom Admin Task Published Live!*\n` +
+            `🆔 \`${newAdminTask.customTaskId}\` • \`${newAdminTask.emailPattern}\` • *₹${newAdminTask.rewardInr.toFixed(2)}* (\`${slots} slots\`)\n\n` +
+            view.text,
+          {
+            parse_mode: "Markdown",
+            reply_markup: view.replyMarkup,
+          }
+        );
+        return;
+      }
 
       // 1. Broadcast Message (Supports Photo + Caption OR Text/Markdown)
       if (currentState === "AWAITING_BROADCAST") {
@@ -2321,15 +3713,16 @@ function createBot(env) {
         return;
       }
 
-      // 3. Dynamic Reward Rate Updates
+      // 3. Dynamic Reward Rate Updates (Standard Task, 2FA Task, Min Withdraw, Referral)
       if (
         currentState === "AWAITING_RATE_TASK" ||
+        currentState === "AWAITING_RATE_2FA_TASK" ||
         currentState === "AWAITING_RATE_MIN_WITHDRAW" ||
         currentState === "AWAITING_RATE_REFERRAL"
       ) {
         const val = parseFloat(text);
         if (isNaN(val) || val <= 0) {
-          await ctx.reply("❌ Please send a valid positive number (e.g. `20` or `50`).", {
+          await ctx.reply("❌ Please send a valid positive number (e.g. `15`, `30`, or `50`).", {
             parse_mode: "Markdown",
             reply_markup: buildAdminCancelInputKeyboard("admin_rates"),
           });
@@ -2338,8 +3731,13 @@ function createBot(env) {
 
         const rates = await getDynamicRates(kv);
         if (currentState === "AWAITING_RATE_TASK") {
+          rates.standardTaskInr = val;
+          rates.standardTaskUsd = Number((val / 75).toFixed(2));
           rates.taskRewardInr = val;
           rates.taskRewardUsd = Number((val / 75).toFixed(2));
+        } else if (currentState === "AWAITING_RATE_2FA_TASK") {
+          rates.twoFactorTaskInr = val;
+          rates.twoFactorTaskUsd = Number((val / 75).toFixed(2));
         } else if (currentState === "AWAITING_RATE_MIN_WITHDRAW") {
           rates.minWithdrawalInr = val;
         } else if (currentState === "AWAITING_RATE_REFERRAL") {
@@ -2395,7 +3793,73 @@ function createBot(env) {
         return;
       }
 
-      // 5. Reject & Refund UPI Payout Reason
+      // 5. Reject Task Submission Reason (AWAITING_TASK_REJECT_REASON)
+      if (currentState === "AWAITING_TASK_REJECT_REASON") {
+        const taskId = user.adminContext?.targetTaskId;
+        const reason = text || "Account remained logged in on user device or invalid credentials";
+        const taskQueue = await getTaskReviewQueue(kv);
+        const idx = taskQueue.findIndex((t) => t.taskId === taskId && t.status === "PENDING");
+
+        user.state = "IDLE";
+        user.adminContext = {};
+        await saveUserData(kv, user);
+
+        if (idx === -1) {
+          await ctx.reply("⚠️ Task submission was not found or already processed.", {
+            reply_markup: buildAdminBackKeyboard(),
+          });
+          return;
+        }
+
+        const taskItem = taskQueue[idx];
+        taskItem.status = "REJECTED";
+        taskItem.rejectReason = reason;
+        taskItem.reviewedAt = new Date().toISOString();
+        taskItem.reviewedBy = String(from.id);
+        await saveTaskReviewQueue(kv, taskQueue);
+
+        const targetUser = await getUserData(kv, taskItem.userId, taskItem.firstName, taskItem.username);
+        targetUser.accounts.pending = Math.max(0, Number(targetUser.accounts.pending || 1) - 1);
+        targetUser.accounts.rejected = Number(targetUser.accounts.rejected || 0) + 1;
+        const histEntry = targetUser.accounts.history.find((h) => h.taskId === taskId);
+        if (histEntry) {
+          histEntry.status = "REJECTED";
+          histEntry.rejectReason = reason;
+        }
+        await saveUserData(kv, targetUser);
+
+        try {
+          await ctx.api.sendMessage(
+            taskItem.userId,
+            `❌ *Gmail Task Submission Rejected*\n` +
+              `━━━━━━━━━━━━━━━━━━━━━━\n` +
+              `🆔 *Task ID:* \`${taskItem.taskId}\`\n` +
+              `📧 *Account:* \`${taskItem.email}\`\n` +
+              `🏷️ *Task Type:* *${taskItem.taskType}*\n` +
+              `💰 *Payout:* \`₹0.00 (Not Paid)\`\n` +
+              `💬 *Admin Reason:* _${escapeMd(reason)}_\n` +
+              `━━━━━━━━━━━━━━━━━━━━━━\n` +
+              `⚠️ *Rule:* Logout from your phone immediately after creating, otherwise admin cannot login and task will be *REJECTED*.`,
+            { parse_mode: "Markdown" }
+          );
+        } catch {
+          // ignore if blocked
+        }
+
+        const view = renderAdminTaskQueueView(taskQueue);
+        await ctx.reply(
+          `❌ *Task ${taskId} Marked as REJECTED & User #${taskItem.userId} Notified!*\n` +
+            `💬 *Reason:* _${escapeMd(reason)}_\n\n` +
+            view.text,
+          {
+            parse_mode: "Markdown",
+            reply_markup: view.replyMarkup,
+          }
+        );
+        return;
+      }
+
+      // 6. Reject & Refund UPI Payout Reason
       if (currentState === "AWAITING_REJECT_REASON") {
         const txId = user.adminContext?.targetTxId;
         const reason = text || "UPI details could not be verified";
@@ -2458,7 +3922,35 @@ function createBot(env) {
         return;
       }
 
-      // 6. Inspect User by ID
+      // 7. Filter Task & Payout History by User ID
+      if (currentState === "AWAITING_HISTORY_USER_ID") {
+        const searchId = text.replace(/\D/g, "");
+        const raw = await kv.get(`user:${searchId}`);
+        if (!searchId || !raw) {
+          await ctx.reply(
+            `❌ *User Not Found!*\nNo user record exists in \`env.BOT_KV\` for ID \`${escapeMd(text)}\`.`,
+            {
+              parse_mode: "Markdown",
+              reply_markup: buildAdminCancelInputKeyboard("admin_task_history"),
+            }
+          );
+          return;
+        }
+
+        user.state = "IDLE";
+        await saveUserData(kv, user);
+
+        const targetUser = await getUserData(kv, searchId);
+        const taskQueue = await getTaskReviewQueue(kv);
+        const view = renderAdminUserTaskAndPayoutHistoryView(targetUser, taskQueue);
+        await ctx.reply(view.text, {
+          parse_mode: "Markdown",
+          reply_markup: view.replyMarkup,
+        });
+        return;
+      }
+
+      // 8. Inspect User by ID
       if (currentState === "AWAITING_INSPECT_USER_ID") {
         const searchId = text.replace(/\D/g, "");
         const raw = await kv.get(`user:${searchId}`);
@@ -2484,7 +3976,7 @@ function createBot(env) {
         return;
       }
 
-      // 7. Add or Deduct User Balance
+      // 9. Add or Deduct User Balance
       if (
         currentState === "AWAITING_USER_ADD_BAL" ||
         currentState === "AWAITING_USER_DEDUCT_BAL"
@@ -2523,7 +4015,84 @@ function createBot(env) {
       }
     }
 
-    // B. USER STATEFUL UPI WITHDRAWAL INPUT (AWAITING_UPI)
+    // B. USER STATEFUL GMAIL + 2FA SUBMISSION INPUT (AWAITING_USER_SUBMIT_GMAIL / AWAITING_2FA_CODES)
+    if (user.state === "AWAITING_USER_SUBMIT_GMAIL" || user.state === "AWAITING_2FA_CODES") {
+      const rates = await getDynamicRates(kv);
+      const activeTask = user.currentTask || generateNewTask("Normal Gmail", rates);
+      const is2FA = activeTask.taskType === "2-Step Gmail";
+
+      const tokens = text.split(/\s+/);
+      const emailTokenIdx = tokens.findIndex((t) => t.includes("@gmail.com"));
+      const submittedEmail =
+        emailTokenIdx !== -1 ? tokens[emailTokenIdx].toLowerCase() : activeTask.email;
+      const remainingText =
+        emailTokenIdx !== -1
+          ? tokens.filter((_, idx) => idx !== emailTokenIdx).join(" ").trim()
+          : text;
+
+      if (!isValidGmailAddress(submittedEmail)) {
+        await ctx.reply(
+          `❌ *Invalid Gmail Address!*\nPlease include the exact \`@gmail.com\` address you created (e.g. \`${activeTask.email}\`).`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: buildAwaitingUserSubmitGmailKeyboard(activeTask),
+          }
+        );
+        return;
+      }
+
+      if (is2FA && (!remainingText || remainingText.length < 4)) {
+        await ctx.reply(
+          `❌ *Missing 2FA Backup Codes / App Password!*\nFor 2-Step Verification tasks, please send the Gmail address followed by your Backup Codes or 16-digit App Password.\n\n*Example:* \`${activeTask.email} 49201842, 83910492\``,
+          {
+            parse_mode: "Markdown",
+            reply_markup: buildAwaitingUserSubmitGmailKeyboard(activeTask),
+          }
+        );
+        return;
+      }
+
+      const queueEntry = await submitTaskForManualVerification(
+        ctx,
+        kv,
+        env,
+        user,
+        activeTask,
+        submittedEmail,
+        is2FA ? remainingText : null
+      );
+
+      const twoFaLine = queueEntry.twoFactorData
+        ? `🔐 *Submitted 2FA Secret:* \`${escapeMd(queueEntry.twoFactorData)}\`\n`
+        : "";
+
+      const confirmText =
+        `⏳ *Task Submitted for Admin Verification!*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🆔 *Task ID:* \`${queueEntry.taskId}\`\n` +
+        `🏷️ *Task Type:* *${queueEntry.taskType}*\n` +
+        `📧 *Submitted Gmail:* \`${queueEntry.email}\`\n` +
+        `🔑 *Password:* \`${queueEntry.password}\`\n` +
+        twoFaLine +
+        `💰 *Reward on Approval:* *+₹${Number(queueEntry.rewardInr).toFixed(2)}*\n` +
+        `🚦 *Status:* \`PENDING ADMIN VERIFICATION\`\n\n` +
+        `⚠️ *Rule: Logout from your phone immediately after creating, otherwise admin cannot login and task will be REJECTED.*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━`;
+
+      const nextKb = new InlineKeyboard()
+        .text("📩 Register Another Account", "menu_register")
+        .text("📑 My Accounts", "menu_accounts")
+        .row()
+        .text("🔙 Back to Main Menu", "menu_home");
+
+      await ctx.reply(confirmText, {
+        parse_mode: "Markdown",
+        reply_markup: nextKb,
+      });
+      return;
+    }
+
+    // C. USER STATEFUL UPI WITHDRAWAL INPUT (AWAITING_UPI)
     if (user.state === "AWAITING_UPI") {
       const rates = await getDynamicRates(kv);
       const tokens = text.split(/\s+/);
@@ -2552,7 +4121,7 @@ function createBot(env) {
           `⚠️ *Insufficient Balance!*\nYour balance (\`₹${user.balanceInr.toFixed(2)}\`) is below the minimum withdrawal limit of \`₹${rates.minWithdrawalInr.toFixed(2)}\`.`,
           {
             parse_mode: "Markdown",
-            reply_markup: buildMainMenuKeyboard(),
+            reply_markup: buildMainMenuKeyboard(isAdmin),
           }
         );
         return;
@@ -2637,7 +4206,7 @@ function createBot(env) {
 
     await ctx.reply(renderHomeText(user), {
       parse_mode: "Markdown",
-      reply_markup: buildMainMenuKeyboard(),
+      reply_markup: buildMainMenuKeyboard(isAdmin),
     });
   });
 
@@ -2649,7 +4218,7 @@ function createBot(env) {
 }
 
 // ============================================================================
-// 12. CLOUDFLARE WORKER EXPORT HANDLER
+// 13. CLOUDFLARE WORKER EXPORT HANDLER
 // ============================================================================
 export default {
   async fetch(request, env, ctx) {
@@ -2658,7 +4227,7 @@ export default {
         JSON.stringify({
           ok: true,
           worker: "gmailworkop",
-          service: "grammY Telegram Task & UPI Bot + Enterprise Admin Panel (Cloudflare Workers)",
+          service: "grammY Telegram Task & UPI Bot + Custom Admin Tasks + Manual Verification Queue",
           kvBound: Boolean(env.BOT_KV),
           botTokenConfigured: Boolean(env.BOT_TOKEN),
           superAdminConfigured: Boolean(env.ADMIN_CHAT_ID),
